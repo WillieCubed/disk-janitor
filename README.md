@@ -83,6 +83,19 @@ AGENT_GUIDANCE=0                         # 1 = manage the guidance block
 
 disk-janitor refuses to operate if `PROJECT_DIRS` points at `$HOME` or `/`.
 
+## Shell completions & man page
+
+Installing via Homebrew sets up `bash`, `zsh`, and `fish` completions and a man page
+automatically. With the `install.sh` bootstrap they're placed under `~/.local/share` (and
+`~/.config/fish`) on a best-effort basis. Then:
+
+```sh
+man disk-janitor
+disk-janitor <TAB>     # complete subcommands and flags
+```
+
+For zsh, ensure the completion dir is on your `fpath` (Homebrew's is by default).
+
 ## How it schedules
 
 - **macOS** — a `launchd` user agent (`~/Library/LaunchAgents/disk-janitor.plist`).

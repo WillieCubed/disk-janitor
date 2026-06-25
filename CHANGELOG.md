@@ -17,3 +17,6 @@ Initial public release.
 - `--dry-run` for `run`, opt-in `--with-agent-guidance`, and `--purge` uninstall.
 - Clean, tracked install/uninstall (backs up and restores pre-existing config files).
 - Safety guard against operating on `$HOME` or `/`.
+- Shell completions for bash, zsh, and fish.
+- A `disk-janitor(1)` man page.
+- Homebrew formula (`WillieCubed/tap/disk-janitor`).

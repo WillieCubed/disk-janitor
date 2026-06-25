@@ -1,0 +1,143 @@
+.TH DISK-JANITOR 1 "2026-06-25" "disk-janitor 0.1.0" "User Commands"
+.SH NAME
+disk-janitor \- stop git worktrees from duplicating build artifacts and sweep regenerable junk on a schedule
+.SH SYNOPSIS
+.B disk-janitor
+.I command
+.RI [ flags ]
+.SH DESCRIPTION
+AI coding agents (Claude Code, Codex, \[char46]\[char46]\[char46]) isolate work in git worktrees.
+Worktrees share git history but not build outputs, so each one gets its own multi-gigabyte
+.B target/
+and
+.BR node_modules .
+.B disk-janitor
+prevents the duplication at the source and sweeps the regenerable remainder on a weekly schedule.
+.PP
+It configures a shared Cargo target directory, enables pnpm store linking
+.RB ( clone
+on APFS,
+.B hardlink
+on Linux), and schedules a job that runs
+.BR cargo-sweep ,
+prunes stale
+.BR node_modules ,
+prunes dangling git worktree metadata, and removes idle
+.B **/.claude/worktrees/agent-*
+checkouts.
+.PP
+Source code and AI-agent chat history are never touched.
+.SH COMMANDS
+.TP
+.B install \fR[\fB--with-agent-guidance\fR] [\fB--dry-run\fR]
+Configure the shared Cargo target dir and pnpm linking, install
+.B cargo-sweep
+if needed, place the CLI on
+.BR PATH ,
+and schedule the weekly cleanup.
+.TP
+.B uninstall \fR[\fB--purge\fR]
+Reverse everything cleanly, restoring any pre-existing config files from backups.
+.B --purge
+also removes
+.B cargo-sweep
+and the application state directory.
+.TP
+.B run \fR[\fB--dry-run\fR|\fB-n\fR]
+Run the cleanup now.
+.B --dry-run
+reports what would be removed and deletes nothing.
+.TP
+.B status
+Show what is configured and the current free space.
+.TP
+.B logs \fR[\fB-f\fR]
+Show (or with
+.BR -f ,
+follow) the run log.
+.TP
+.B config
+Print the configuration file path and its contents.
+.TP
+.B version
+Print the version.
+.TP
+.B help
+Show usage.
+.SH OPTIONS
+.TP
+.B --with-agent-guidance
+On
+.BR install ,
+manage a short worktree-guidance block in agent config files
+.RB ( ~/.codex/AGENTS.md ,
+.BR ~/.claude/CLAUDE.md )
+when they exist. Off by default.
+.TP
+.B --dry-run \fR(\fB-n\fR)
+Preview destructive actions without performing them.
+.TP
+.B --purge
+On
+.BR uninstall ,
+also remove
+.B cargo-sweep
+and
+.BR ~/.disk-janitor .
+.SH CONFIGURATION
+.B install
+writes
+.BR ~/.disk-janitor/config.env .
+Edit it and re-run
+.B install
+to apply. Key settings:
+.BR TARGET_DIR ,
+.BR PROJECT_DIRS ,
+.BR NPM_IMPORT_METHOD ,
+.BR SWEEP_DAYS ,
+.BR NM_DAYS ,
+.BR WORKTREE_DAYS ,
+.BR RUN_WEEKDAY / RUN_HOUR / RUN_MINUTE ,
+and
+.BR AGENT_GUIDANCE .
+.B disk-janitor
+refuses to operate if
+.B PROJECT_DIRS
+points at
+.B $HOME
+or
+.BR / .
+.SH FILES
+.TP
+.B ~/.disk-janitor/config.env
+User configuration.
+.TP
+.B ~/.disk-janitor/state
+Tracked install state (backups and origins for clean uninstall).
+.TP
+.B ~/Library/LaunchAgents/disk-janitor.plist
+Scheduled job on macOS (launchd).
+.TP
+.B ~/.config/systemd/user/disk-janitor.timer
+Scheduled job on Linux (systemd user timer); a crontab entry is used as a fallback.
+.SH "WHAT IT NEVER TOUCHES"
+Source code, and AI-agent chat history / transcripts:
+.BR ~/.claude/projects ,
+.BR ~/.codex/sessions ,
+and similar. Only regenerable build artifacts and abandoned worktree checkouts are removed.
+.SH "EXIT STATUS"
+.B 0
+on success;
+.B 1
+on an unknown command or flag;
+.B 2
+when a configured project directory is unsafe (for example
+.BR $HOME ).
+.SH "SEE ALSO"
+.BR cargo-sweep (1),
+.BR pnpm (1),
+.BR git-worktree (1)
+.SH "REPORTING BUGS"
+https://github.com/WillieCubed/disk-janitor/issues
+.SH LICENSE
+MIT.
