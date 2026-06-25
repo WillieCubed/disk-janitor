@@ -13,7 +13,7 @@
 set -uo pipefail
 
 APP_NAME="disk-janitor"
-APP_VERSION="0.1.1"
+APP_VERSION="0.1.2"
 APP_HOME="${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"
 STATE_DIR="$APP_HOME/state"
 CONFIG_FILE="$APP_HOME/config.env"
@@ -163,7 +163,7 @@ sched_install() {
 <dict>
   <key>Label</key><string>$PLIST_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>$SELF_CANONICAL</string><string>run</string><string>--cron</string></array>
+  <array><string>$SELF_CANONICAL</string><string>run</string><string>--cron</string></array>
   <key>StartCalendarInterval</key>
   <dict><key>Weekday</key><integer>$RUN_WEEKDAY</integer><key>Hour</key><integer>$RUN_HOUR</integer><key>Minute</key><integer>$RUN_MINUTE</integer></dict>
   <key>StandardErrorPath</key><string>$ERRLOG</string>
@@ -179,7 +179,7 @@ EOF
 Description=$APP_NAME cleanup
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/env bash $SELF_CANONICAL run --cron
+ExecStart=$SELF_CANONICAL run --cron
 EOF
       cat > "$TIMER" <<EOF
 [Unit]
@@ -195,7 +195,7 @@ EOF
     cron)
       if [ -z "$NO_SCHED" ]; then
         ( crontab -l 2>/dev/null | grep -v "$CRON_MARKER"
-          echo "$RUN_MINUTE $RUN_HOUR * * $RUN_WEEKDAY /usr/bin/env bash $SELF_CANONICAL run --cron $CRON_MARKER" ) | crontab -
+          echo "$RUN_MINUTE $RUN_HOUR * * $RUN_WEEKDAY $SELF_CANONICAL run --cron $CRON_MARKER" ) | crontab -
       fi
       ok "weekly job added to crontab ($(weekday_name "$RUN_WEEKDAY") $hhmm)" ;;
   esac
@@ -277,8 +277,11 @@ cmd_install() {
 
   mkdir -p "$APP_HOME" "$STATE_DIR" "$(dirname "$BIN_LINK")" "$(dirname "$LOG")" "$TARGET_DIR"
   local here; here="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  [ "$here" = "$SELF_CANONICAL" ] || cp "$0" "$SELF_CANONICAL"
-  chmod +x "$SELF_CANONICAL"; ln -sf "$SELF_CANONICAL" "$BIN_LINK"
+  if [ "$here" != "$SELF_CANONICAL" ]; then
+    rm -f "$SELF_CANONICAL"   # old copy may be read-only (e.g. from a Homebrew Cellar source); cp can't overwrite it
+    cp "$0" "$SELF_CANONICAL"
+  fi
+  chmod u+wx "$SELF_CANONICAL"; ln -sf "$SELF_CANONICAL" "$BIN_LINK"
   write_default_config
   # persist the guidance choice
   grep -q '^AGENT_GUIDANCE=' "$CONFIG_FILE" 2>/dev/null \

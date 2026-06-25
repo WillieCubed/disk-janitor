@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [0.1.2] - 2026-06-25
+
+### Fixed
+- The scheduled job ran `/bin/bash <script>`, so macOS attributed background activity to
+  "bash" ("'bash' can run in the background"). The launchd/systemd/cron entries now invoke the
+  `disk-janitor` script directly so it is named correctly.
+- `install` could not refresh its on-disk copy when the source binary was read-only (e.g. a
+  Homebrew Cellar path), so `brew upgrade` left the scheduler running the old version. It now
+  removes the old copy first and marks the new one writable.
+
 ## [0.1.1] - 2026-06-25
 
 ### Fixed
