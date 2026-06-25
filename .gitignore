@@ -1,0 +1,4 @@
+# nothing built here; keep the repo clean
+*.log
+*.tmp
+.DS_Store

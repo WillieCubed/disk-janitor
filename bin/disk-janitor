@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# disk-janitor — stop git worktrees from duplicating build artifacts, and sweep
+# regenerable junk on a schedule. Designed for machines where AI coding agents
+# (Claude Code, Codex, …) spawn many worktrees that each re-duplicate target/ and
+# node_modules.
+#
+# It NEVER touches source code or agent chat history. Everything it changes on
+# `install` is tracked so `uninstall` reverses it cleanly.
+#
+# Portable bash 3.2+ (works with stock macOS /bin/bash). macOS + Linux.
+# Literal "~" appears in user-facing messages on purpose (display only, never a path arg).
+# shellcheck disable=SC2088
+set -uo pipefail
+
+APP_NAME="disk-janitor"
+APP_VERSION="0.1.0"
+APP_HOME="${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"
+STATE_DIR="$APP_HOME/state"
+CONFIG_FILE="$APP_HOME/config.env"
+SELF_CANONICAL="$APP_HOME/$APP_NAME"
+SENTINEL="managed-by: $APP_NAME"
+
+OS="$(uname -s)"
+case "$OS" in
+  Darwin)
+    LOG="$HOME/Library/Logs/$APP_NAME.log"; ERRLOG="$HOME/Library/Logs/$APP_NAME.err"
+    DATA_PATH_DEFAULT="/System/Volumes/Data"; NPM_IMPORT_DEFAULT="clone" ;;
+  *)
+    LOG="${XDG_STATE_HOME:-$HOME/.local/state}/$APP_NAME/$APP_NAME.log"; ERRLOG="$LOG"
+    DATA_PATH_DEFAULT="$HOME"; NPM_IMPORT_DEFAULT="hardlink" ;;
+esac
+BIN_LINK="$HOME/.local/bin/$APP_NAME"
+
+# ---- defaults (override in $CONFIG_FILE) ----
+TARGET_DIR="$HOME/.cache/cargo-target"        # shared Cargo target dir
+PROJECT_DIRS=("$HOME/Projects")               # roots to scan for worktrees/builds
+GIT_REPOS=()                                  # empty = auto-discover under PROJECT_DIRS
+DATA_PATH="$DATA_PATH_DEFAULT"                # filesystem to report free space for
+NPM_IMPORT_METHOD="$NPM_IMPORT_DEFAULT"       # pnpm package-import-method
+SWEEP_DAYS=10                                 # cargo artifacts older than this are swept
+NM_DAYS=30                                    # node_modules untouched this long are removed
+WORKTREE_DAYS=14                              # agent worktree checkouts idle this long are removed
+RUN_WEEKDAY=0                                 # 0=Sunday
+RUN_HOUR=3
+RUN_MINUTE=0
+AGENT_GUIDANCE=0                              # 1 = manage worktree guidance in agent config files
+AGENT_GUIDANCE_FILES=("$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md")
+# shellcheck source=/dev/null
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# env hooks (used by tests / CI; not for normal use)
+NO_SCHED="${DISK_JANITOR_NO_SCHED:-}"         # skip launchctl/systemctl/crontab activation
+DRY=0
+
+if [ -t 1 ]; then
+  c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_red=$'\033[31m'; c_yel=$'\033[33m'; c_0=$'\033[0m'
+else
+  c_bold=""; c_dim=""; c_grn=""; c_red=""; c_yel=""; c_0=""
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s\n' "${c_grn}✓${c_0} $*"; }
+warn() { printf '%s\n' "${c_yel}!${c_0} $*"; }
+err()  { printf '%s\n' "${c_red}✗${c_0} $*" >&2; }
+free_space() { df -Ph "$DATA_PATH" 2>/dev/null | awk 'NR==2 {print $4}'; }
+human() { du -sh "$1" 2>/dev/null | awk '{print $1}'; }
+tilde() { case "$1" in "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}";; *) printf '%s\n' "$1";; esac; }
+
+# ---------- managed-file helpers (clean install/uninstall) ----------
+manage_file() { # path content key
+  local path="$1" content="$2" key="$3"; local origin="$STATE_DIR/origins/$key"
+  mkdir -p "$STATE_DIR/origins" "$STATE_DIR/backups"
+  if [ ! -f "$origin" ]; then
+    if [ -e "$path" ] && ! grep -q "$SENTINEL" "$path" 2>/dev/null; then
+      cp "$path" "$STATE_DIR/backups/$key"; echo backup > "$origin"
+    else
+      echo created > "$origin"
+    fi
+  fi
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$content" > "$path"
+}
+restore_file() { # path key
+  local path="$1" key="$2"; local origin="$STATE_DIR/origins/$key"
+  [ -f "$origin" ] || return 0
+  if [ "$(cat "$origin")" = backup ] && [ -e "$STATE_DIR/backups/$key" ]; then
+    mv -f "$STATE_DIR/backups/$key" "$path"
+  else
+    rm -f "$path"
+  fi
+  rm -f "$origin"
+}
+
+# ---------- agent worktree guidance (opt-in) ----------
+agents_block() {
+  cat <<EOF
+<!-- $APP_NAME:worktrees -->
+# Worktrees & build artifacts
+
+A shared Cargo target dir (\`$TARGET_DIR\`, in \`~/.cargo/config.toml\`) and pnpm
+linking (\`package-import-method=$NPM_IMPORT_METHOD\` in \`~/.npmrc\`) are configured globally so build
+artifacts are not duplicated across git worktrees.
+
+- Do **not** override \`CARGO_TARGET_DIR\` or set a per-worktree \`target-dir\`.
+- Do **not** change \`package-import-method\`; \`pnpm install\` should link from the shared store.
+- When a worktree's branch is merged or abandoned, \`git worktree remove <path>\` (then \`git worktree prune\`).
+- Never copy \`node_modules\`/\`target\` between worktrees.
+<!-- /$APP_NAME:worktrees -->
+EOF
+}
+strip_agents_block() { # file -> stdout
+  awk -v a="<!-- $APP_NAME:worktrees -->" -v b="<!-- /$APP_NAME:worktrees -->" '
+    $0 ~ a {skip=1} skip==0 {print} $0 ~ b {skip=0}' "$1"
+}
+ensure_agents_block() {
+  [ "$AGENT_GUIDANCE" = 1 ] || return 0
+  local f tmp
+  for f in "${AGENT_GUIDANCE_FILES[@]}"; do
+    [ -f "$f" ] || continue
+    tmp="$(mktemp)"; strip_agents_block "$f" > "$tmp"
+    printf '\n' >> "$tmp"; agents_block >> "$tmp"; mv "$tmp" "$f"
+    ok "guidance block written to $(tilde "$f")"
+  done
+}
+remove_agents_block() {
+  local f tmp
+  for f in "${AGENT_GUIDANCE_FILES[@]}"; do
+    [ -f "$f" ] || continue
+    grep -q "<!-- $APP_NAME:worktrees -->" "$f" || continue
+    tmp="$(mktemp)"; strip_agents_block "$f" \
+      | awk '{a[NR]=$0} END{last=NR; while(last>0 && a[last]~/^[[:space:]]*$/) last--; for(i=1;i<=last;i++) print a[i]}' > "$tmp"
+    mv "$tmp" "$f"; ok "guidance block removed from $(tilde "$f")"
+  done
+}
+
+# ---------- scheduler abstraction (launchd / systemd / cron) ----------
+PLIST_LABEL="$APP_NAME"
+PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SERVICE="$SYSTEMD_DIR/$APP_NAME.service"
+TIMER="$SYSTEMD_DIR/$APP_NAME.timer"
+CRON_MARKER="# $APP_NAME-cron"
+
+sched_kind() { # decide scheduler for this OS
+  case "$OS" in
+    Darwin) echo launchd ;;
+    *) if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then echo systemd; else echo cron; fi ;;
+  esac
+}
+weekday_name() { case "$1" in 0) echo Sun;;1) echo Mon;;2) echo Tue;;3) echo Wed;;4) echo Thu;;5) echo Fri;;6) echo Sat;;*) echo Sun;; esac; }
+
+sched_install() {
+  local kind; kind="$(sched_kind)"; echo "$kind" > "$STATE_DIR/scheduler"
+  local hhmm; hhmm="$(printf '%02d:%02d' "$RUN_HOUR" "$RUN_MINUTE")"
+  case "$kind" in
+    launchd)
+      mkdir -p "$(dirname "$PLIST")"
+      cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$SELF_CANONICAL</string><string>run</string><string>--cron</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Weekday</key><integer>$RUN_WEEKDAY</integer><key>Hour</key><integer>$RUN_HOUR</integer><key>Minute</key><integer>$RUN_MINUTE</integer></dict>
+  <key>StandardErrorPath</key><string>$ERRLOG</string>
+</dict>
+</plist>
+EOF
+      [ -n "$NO_SCHED" ] || { launchctl unload "$PLIST" 2>/dev/null; launchctl load "$PLIST"; }
+      ok "weekly job loaded via launchd ($(weekday_name "$RUN_WEEKDAY") $hhmm)" ;;
+    systemd)
+      mkdir -p "$SYSTEMD_DIR"
+      cat > "$SERVICE" <<EOF
+[Unit]
+Description=$APP_NAME cleanup
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash $SELF_CANONICAL run --cron
+EOF
+      cat > "$TIMER" <<EOF
+[Unit]
+Description=$APP_NAME weekly cleanup
+[Timer]
+OnCalendar=$(weekday_name "$RUN_WEEKDAY") *-*-* $hhmm:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+      [ -n "$NO_SCHED" ] || { systemctl --user daemon-reload; systemctl --user enable --now "$APP_NAME.timer"; }
+      ok "weekly job loaded via systemd ($(weekday_name "$RUN_WEEKDAY") $hhmm)" ;;
+    cron)
+      if [ -z "$NO_SCHED" ]; then
+        ( crontab -l 2>/dev/null | grep -v "$CRON_MARKER"
+          echo "$RUN_MINUTE $RUN_HOUR * * $RUN_WEEKDAY /usr/bin/env bash $SELF_CANONICAL run --cron $CRON_MARKER" ) | crontab -
+      fi
+      ok "weekly job added to crontab ($(weekday_name "$RUN_WEEKDAY") $hhmm)" ;;
+  esac
+}
+sched_uninstall() {
+  local kind; kind="$(cat "$STATE_DIR/scheduler" 2>/dev/null || sched_kind)"
+  case "$kind" in
+    launchd) [ -n "$NO_SCHED" ] || launchctl unload "$PLIST" 2>/dev/null; rm -f "$PLIST" ;;
+    systemd) [ -n "$NO_SCHED" ] || { systemctl --user disable --now "$APP_NAME.timer" 2>/dev/null; }; rm -f "$SERVICE" "$TIMER"; [ -n "$NO_SCHED" ] || systemctl --user daemon-reload 2>/dev/null ;;
+    cron)    [ -n "$NO_SCHED" ] || crontab -l 2>/dev/null | grep -v "$CRON_MARKER" | crontab - 2>/dev/null ;;
+  esac
+  rm -f "$STATE_DIR/scheduler"
+  ok "scheduled job removed"
+}
+sched_loaded() {
+  case "$OS" in
+    Darwin) launchctl list 2>/dev/null | grep -q "$PLIST_LABEL" ;;
+    *) [ -f "$TIMER" ] || crontab -l 2>/dev/null | grep -q "$CRON_MARKER" ;;
+  esac
+}
+
+# ---------- config + repo discovery ----------
+write_default_config() {
+  [ -f "$CONFIG_FILE" ] && return 0
+  mkdir -p "$APP_HOME"
+  { echo "# $APP_NAME config — edit, then re-run \`$APP_NAME install\` to apply."
+    echo "TARGET_DIR=\"$TARGET_DIR\""
+    printf 'PROJECT_DIRS=('; printf '%q ' "${PROJECT_DIRS[@]}"; echo ')'
+    echo "# GIT_REPOS=()   # empty = auto-discover git repos under PROJECT_DIRS"
+    echo "DATA_PATH=\"$DATA_PATH\""
+    echo "NPM_IMPORT_METHOD=\"$NPM_IMPORT_METHOD\""
+    echo "SWEEP_DAYS=$SWEEP_DAYS"
+    echo "NM_DAYS=$NM_DAYS"
+    echo "WORKTREE_DAYS=$WORKTREE_DAYS"
+    echo "RUN_WEEKDAY=$RUN_WEEKDAY   # 0=Sunday"
+    echo "RUN_HOUR=$RUN_HOUR"
+    echo "RUN_MINUTE=$RUN_MINUTE"
+    echo "AGENT_GUIDANCE=$AGENT_GUIDANCE"
+  } > "$CONFIG_FILE"
+}
+discover_git_repos() { # echo git repo roots under PROJECT_DIRS (depth<=2)
+  local d
+  for d in "${PROJECT_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 3 -type d -name .git -prune 2>/dev/null | while read -r g; do dirname "$g"; done
+  done
+}
+guard_paths() { # refuse to operate on $HOME or /
+  local d
+  for d in "${PROJECT_DIRS[@]}"; do
+    case "$d" in
+      "$HOME"|"/"|"") err "refusing to operate on project dir '$d' (too broad). Fix PROJECT_DIRS in $CONFIG_FILE."; exit 2 ;;
+    esac
+  done
+}
+
+# ====================== commands ======================
+cmd_install() {
+  local with_guidance=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-agent-guidance) with_guidance=1 ;;
+      --dry-run) DRY=1 ;;
+      *) err "unknown install flag: $1"; exit 1 ;;
+    esac; shift
+  done
+  [ "$with_guidance" = 1 ] && AGENT_GUIDANCE=1
+  guard_paths
+
+  mkdir -p "$APP_HOME" "$STATE_DIR" "$(dirname "$BIN_LINK")" "$(dirname "$LOG")" "$TARGET_DIR"
+  local here; here="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  [ "$here" = "$SELF_CANONICAL" ] || cp "$0" "$SELF_CANONICAL"
+  chmod +x "$SELF_CANONICAL"; ln -sf "$SELF_CANONICAL" "$BIN_LINK"
+  write_default_config
+  # persist the guidance choice
+  grep -q '^AGENT_GUIDANCE=' "$CONFIG_FILE" 2>/dev/null \
+    && sed_i "s/^AGENT_GUIDANCE=.*/AGENT_GUIDANCE=$AGENT_GUIDANCE/" "$CONFIG_FILE"
+
+  manage_file "$HOME/.cargo/config.toml" \
+"# $SENTINEL — shared Cargo target dir (deps compile once across worktrees)
+[build]
+target-dir = \"$TARGET_DIR\"" cargo-config
+  ok "shared Cargo target dir → $TARGET_DIR"
+
+  manage_file "$HOME/.npmrc" \
+"# $SENTINEL — link node_modules from the pnpm store instead of copying
+package-import-method=$NPM_IMPORT_METHOD" npmrc
+  ok "pnpm linking: package-import-method=$NPM_IMPORT_METHOD"
+
+  if command -v cargo-sweep >/dev/null 2>&1; then ok "cargo-sweep present ($(cargo-sweep --version 2>/dev/null))"
+  elif command -v cargo >/dev/null 2>&1; then
+    warn "installing cargo-sweep…"
+    if cargo install cargo-sweep >/dev/null 2>&1; then ok "cargo-sweep installed"; else warn "cargo-sweep install failed (sweeps will be skipped)"; fi
+  else warn "cargo not found; sweeps will be skipped"; fi
+
+  ensure_agents_block
+  [ "$AGENT_GUIDANCE" = 1 ] || say "${c_dim}(agent guidance off — enable with 'install --with-agent-guidance')${c_0}"
+
+  sched_install
+  echo; ok "${c_bold}$APP_NAME installed.${c_0}  Try '$APP_NAME status' or '$APP_NAME run --dry-run'."
+}
+
+cmd_uninstall() {
+  local purge="${1:-}"
+  sched_uninstall
+  restore_file "$HOME/.cargo/config.toml" cargo-config; ok "~/.cargo/config.toml reverted"
+  restore_file "$HOME/.npmrc" npmrc; ok "~/.npmrc reverted"
+  remove_agents_block
+  rm -f "$BIN_LINK"; ok "removed $BIN_LINK"
+  if [ "$purge" = "--purge" ]; then
+    command -v cargo-sweep >/dev/null 2>&1 && cargo uninstall cargo-sweep >/dev/null 2>&1 && ok "cargo-sweep uninstalled"
+    rm -rf "$APP_HOME"; ok "removed $APP_HOME"
+    warn "shared target dir $TARGET_DIR left in place (delete manually if desired)"
+  else
+    say "${c_dim}(kept cargo-sweep, $APP_HOME, logs. Use 'uninstall --purge' to remove them too.)${c_0}"
+  fi
+  ok "${c_bold}$APP_NAME uninstalled.${c_0}"
+}
+
+cmd_run() {
+  local cron=""
+  while [ $# -gt 0 ]; do case "$1" in --cron) cron=1 ;; --dry-run|-n) DRY=1 ;; *) err "unknown run flag: $1"; exit 1 ;; esac; shift; done
+  guard_paths
+  local before; before="$(free_space)"
+  run_body() {
+    echo "=== $(date) ${DRY:+[dry-run] }run start (free: $before) ==="
+    # 1. Rust artifacts
+    if command -v cargo-sweep >/dev/null 2>&1; then
+      if [ "$DRY" = 1 ]; then echo "would: cargo sweep -r --time $SWEEP_DAYS for $TARGET_DIR ${PROJECT_DIRS[*]}"
+      else cargo sweep -r --time "$SWEEP_DAYS" "$TARGET_DIR" "${PROJECT_DIRS[@]}" 2>&1 || true; fi
+    else echo "cargo-sweep missing; skipping sweep"; fi
+    # 2. stale node_modules
+    local d
+    for d in "${PROJECT_DIRS[@]}"; do
+      [ -d "$d" ] || continue
+      if [ "$DRY" = 1 ]; then
+        find "$d" -type d -name node_modules -prune -mtime +"$NM_DAYS" 2>/dev/null | while read -r nm; do echo "would remove node_modules ($(human "$nm")): $nm"; done
+      else find "$d" -type d -name node_modules -prune -mtime +"$NM_DAYS" -exec rm -rf {} + 2>&1 || true; fi
+    done
+    # 3. prune dangling worktree metadata
+    local repo
+    if [ "${#GIT_REPOS[@]}" -gt 0 ]; then printf '%s\n' "${GIT_REPOS[@]}"; else discover_git_repos; fi | sort -u | while read -r repo; do
+      [ -d "$repo/.git" ] || continue
+      if [ "$DRY" = 1 ]; then git -C "$repo" worktree prune --dry-run 2>&1 | sed "s|^|would prune ($repo): |"
+      else git -C "$repo" worktree prune 2>&1 || true; fi
+    done
+    # 4. stale agent worktree checkouts
+    for d in "${PROJECT_DIRS[@]}"; do
+      [ -d "$d" ] || continue
+      if [ "$DRY" = 1 ]; then
+        find "$d" -type d -path '*/.claude/worktrees/agent-*' -prune -mtime +"$WORKTREE_DAYS" 2>/dev/null | while read -r wt; do echo "would remove agent worktree ($(human "$wt")): $wt"; done
+      else find "$d" -type d -path '*/.claude/worktrees/agent-*' -prune -mtime +"$WORKTREE_DAYS" -exec rm -rf {} + 2>&1 || true; fi
+    done
+    # 5. prune pnpm store
+    if command -v pnpm >/dev/null 2>&1; then
+      [ "$DRY" = 1 ] && echo "would: pnpm store prune" || pnpm store prune 2>&1 || true
+    fi
+    echo "=== $(date) run done (free: $(free_space)) ==="
+  }
+  mkdir -p "$(dirname "$LOG")"
+  if [ "$cron" = 1 ]; then run_body >> "$LOG" 2>&1
+  else run_body 2>&1 | tee -a "$LOG"; echo; ok "${DRY:+[dry-run] }done — free: $before → $(free_space)"; fi
+}
+
+cmd_status() {
+  printf '%s\n' "${c_bold}$APP_NAME v$APP_VERSION${c_0} ($OS)"
+  printf '  free space (%s): %s\n' "$DATA_PATH" "${c_bold}$(free_space)${c_0}"
+  if sched_loaded; then ok "scheduled job: active ($(weekday_name "$RUN_WEEKDAY") $(printf '%02d:%02d' "$RUN_HOUR" "$RUN_MINUTE"))"; else warn "scheduled job: not active"; fi
+  if grep -q "$SENTINEL" "$HOME/.cargo/config.toml" 2>/dev/null; then ok "cargo shared target dir: $TARGET_DIR"; else warn "cargo shared target dir: not configured"; fi
+  if grep -q "$SENTINEL" "$HOME/.npmrc" 2>/dev/null; then ok "pnpm linking: on ($NPM_IMPORT_METHOD)"; else warn "pnpm linking: off"; fi
+  if command -v cargo-sweep >/dev/null 2>&1; then ok "cargo-sweep: $(cargo-sweep --version 2>/dev/null)"; else warn "cargo-sweep: missing"; fi
+  if [ "$AGENT_GUIDANCE" = 1 ]; then ok "agent guidance: managed"; else say "  ${c_dim}agent guidance: off${c_0}"; fi
+  if [ -L "$BIN_LINK" ]; then ok "CLI on PATH: $BIN_LINK"; else warn "CLI not linked to $BIN_LINK"; fi
+  if [ -f "$LOG" ]; then local last; last="$(grep 'run done' "$LOG" | tail -1)"; [ -n "$last" ] && printf '  last run: %s\n' "${c_dim}${last#=== }${c_0}"; fi
+}
+
+cmd_logs()    { if [ ! -f "$LOG" ]; then warn "no log yet"; return 0; fi; if [ "${1:-}" = "-f" ]; then tail -f "$LOG"; else tail -n 40 "$LOG"; fi; }
+cmd_config()  { say "$CONFIG_FILE"; [ -f "$CONFIG_FILE" ] && { echo; cat "$CONFIG_FILE"; }; }
+
+# portable in-place sed (BSD vs GNU)
+sed_i() { if sed --version >/dev/null 2>&1; then sed -i "$1" "$2"; else sed -i '' "$1" "$2"; fi; }
+
+cmd_help() {
+  cat <<EOF
+${c_bold}$APP_NAME${c_0} v$APP_VERSION — keep git worktrees from eating your disk.
+
+${c_bold}USAGE${c_0}
+  $APP_NAME <command> [flags]
+
+${c_bold}COMMANDS${c_0}
+  install [--with-agent-guidance] [--dry-run]
+                     shared Cargo target dir + pnpm linking + weekly scheduled cleanup
+  uninstall [--purge]  reverse everything cleanly (--purge also removes cargo-sweep & state)
+  run [--dry-run|-n]   run the cleanup now (sweep artifacts, prune stale worktrees/node_modules)
+  status               show what's configured and current free space
+  logs [-f]            show (or follow) the run log
+  config               print the config file path + contents
+  version              print version
+  help                 this help
+
+Edit the config (see '$APP_NAME config') then re-run 'install' to change schedule/thresholds.
+Source code and agent chat history are never touched.
+EOF
+}
+
+case "${1:-help}" in
+  install)   shift; cmd_install "$@" ;;
+  uninstall) cmd_uninstall "${2:-}" ;;
+  run)       shift; cmd_run "$@" ;;
+  status)    cmd_status ;;
+  logs)      cmd_logs "${2:-}" ;;
+  config)    cmd_config ;;
+  version)   say "$APP_NAME v$APP_VERSION" ;;
+  help|-h|--help) cmd_help ;;
+  *) err "unknown command: $1"; echo; cmd_help; exit 1 ;;
+esac
