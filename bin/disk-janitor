@@ -13,7 +13,7 @@
 set -uo pipefail
 
 APP_NAME="disk-janitor"
-APP_VERSION="0.1.3"
+APP_VERSION="0.1.4"
 APP_HOME="${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"
 STATE_DIR="$APP_HOME/state"
 CONFIG_FILE="$APP_HOME/config.env"
@@ -50,7 +50,7 @@ AGENT_GUIDANCE_FILES=("$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md")
 
 # env hooks (used by tests / CI; not for normal use)
 NO_SCHED="${DISK_JANITOR_NO_SCHED:-}"         # skip launchctl/systemctl/crontab activation
-DRY=0
+DRY=""                                        # empty = normal; "1" = dry-run (keep empty so ${DRY:+…} works)
 
 if [ -t 1 ]; then
   c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_red=$'\033[31m'; c_yel=$'\033[33m'; c_0=$'\033[0m'

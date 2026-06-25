@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [0.1.4] - 2026-06-25
+
+### Fixed
+- Scheduled (cron) runs were logged with a `[dry-run]` label even though they performed real
+  work, because `DRY` defaulted to `0` (non-empty) and tripped `${DRY:+…}`. `DRY` now defaults
+  to empty. No behavior change — only the misleading log label.
+
 ## [0.1.3] - 2026-06-25
 
 ### Fixed
