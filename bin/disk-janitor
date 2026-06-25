@@ -13,7 +13,7 @@
 set -uo pipefail
 
 APP_NAME="disk-janitor"
-APP_VERSION="0.1.0"
+APP_VERSION="0.1.1"
 APP_HOME="${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"
 STATE_DIR="$APP_HOME/state"
 CONFIG_FILE="$APP_HOME/config.env"
@@ -117,7 +117,8 @@ ensure_agents_block() {
   for f in "${AGENT_GUIDANCE_FILES[@]}"; do
     [ -f "$f" ] || continue
     tmp="$(mktemp)"; strip_agents_block "$f" > "$tmp"
-    printf '\n' >> "$tmp"; agents_block >> "$tmp"; mv "$tmp" "$f"
+    printf '\n' >> "$tmp"; agents_block >> "$tmp"
+    cat "$tmp" > "$f"; rm -f "$tmp"   # write through symlinks (don't clobber them with mv)
     ok "guidance block written to $(tilde "$f")"
   done
 }
@@ -128,7 +129,8 @@ remove_agents_block() {
     grep -q "<!-- $APP_NAME:worktrees -->" "$f" || continue
     tmp="$(mktemp)"; strip_agents_block "$f" \
       | awk '{a[NR]=$0} END{last=NR; while(last>0 && a[last]~/^[[:space:]]*$/) last--; for(i=1;i<=last;i++) print a[i]}' > "$tmp"
-    mv "$tmp" "$f"; ok "guidance block removed from $(tilde "$f")"
+    cat "$tmp" > "$f"; rm -f "$tmp"   # write through symlinks
+    ok "guidance block removed from $(tilde "$f")"
   done
 }
 
@@ -209,9 +211,19 @@ sched_uninstall() {
   ok "scheduled job removed"
 }
 sched_loaded() {
+  # Capture then match: `cmd | grep -q` aborts the producer early, and under
+  # `set -o pipefail` that surfaces as SIGPIPE (141) — a false negative.
+  local out
   case "$OS" in
-    Darwin) launchctl list 2>/dev/null | grep -q "$PLIST_LABEL" ;;
-    *) [ -f "$TIMER" ] || crontab -l 2>/dev/null | grep -q "$CRON_MARKER" ;;
+    Darwin)
+      out="$(launchctl list 2>/dev/null)"
+      case "$out" in *"$PLIST_LABEL"*) return 0 ;; *) return 1 ;; esac
+      ;;
+    *)
+      [ -f "$TIMER" ] && return 0
+      out="$(crontab -l 2>/dev/null || true)"
+      case "$out" in *"$CRON_MARKER"*) return 0 ;; *) return 1 ;; esac
+      ;;
   esac
 }
 
