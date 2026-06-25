@@ -13,7 +13,7 @@
 set -uo pipefail
 
 APP_NAME="disk-janitor"
-APP_VERSION="0.1.2"
+APP_VERSION="0.1.3"
 APP_HOME="${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"
 STATE_DIR="$APP_HOME/state"
 CONFIG_FILE="$APP_HOME/config.env"
@@ -331,6 +331,8 @@ cmd_uninstall() {
 cmd_run() {
   local cron=""
   while [ $# -gt 0 ]; do case "$1" in --cron) cron=1 ;; --dry-run|-n) DRY=1 ;; *) err "unknown run flag: $1"; exit 1 ;; esac; shift; done
+  # Scheduled runs (launchd/systemd/cron) inherit a minimal PATH; make cargo-sweep, pnpm, etc. findable.
+  export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
   guard_paths
   local before; before="$(free_space)"
   run_body() {

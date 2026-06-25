@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [0.1.3] - 2026-06-25
+
+### Fixed
+- Scheduled runs inherit a minimal PATH (launchd/systemd/cron), so `cargo-sweep` and `pnpm`
+  were not found and the sweep silently skipped. `run` now prepends `~/.cargo/bin`,
+  `/opt/homebrew/bin`, and `/usr/local/bin` to PATH.
+
 ## [0.1.2] - 2026-06-25
 
 ### Fixed
