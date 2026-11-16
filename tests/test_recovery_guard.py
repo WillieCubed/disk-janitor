@@ -49,7 +49,7 @@ class RecoveryGuardTests(unittest.TestCase):
         out.mkdir()
         args = ['guard', '--owner', name, '--job-id', name, '--artifact-root', str(out),
                 '--root-reserve-gib', '.05', '--planned-gib', '.04', '--warn-free-gib', '0',
-                '--recovery-after-seconds', '.1', '--deadline-seconds', '15', *extra,
+                '--recovery-after-seconds', '.1', '--deadline-seconds', '15', '--max-running', '1', *extra,
                 '--', sys.executable, '-c', code]
         bootstrap=BOOTSTRAP.replace("str(Path(sys.argv[1]).resolve().parent)","str(Path(os.environ['DISK_JANITOR_HOME']).resolve())")
         script=getattr(self,'fixture_script',REPO/'bin/disk-janitor')

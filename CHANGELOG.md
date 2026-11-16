@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## Unreleased
+
+### Changed
+- A job waits only for a free slot. Slots follow the machine's cores and memory, the queue is
+  first come, first served, and `status` shows each waiting job's position. Disk is decided when
+  the slot is held: above the floor the job starts, below it one short recovery runs and the job
+  starts or fails with the numbers. Reservation records, retention measurement, a running
+  recovery and busy locks no longer delay a start.
+- Commands that run no build tool start at once without a slot.
+- Recovery no longer waits for running jobs or for the admission lock, and a watchdog keeps free
+  space above a low-water mark every minute.
+
+### Added
+- Recovery of Gradle `build` outputs in idle git checkouts.
+- Retirement of reservation records whose guardian is gone.
+
+### Fixed
+- The command-line tool selects a Python 3.10+ interpreter instead of failing in the middle of a
+  scheduled run under the system interpreter.
+
 ## [0.1.4] - 2026-06-25
 
 ### Fixed

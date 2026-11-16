@@ -130,18 +130,28 @@ are:
 Private hashed command/workspace observations can raise future estimates.
 Ordinary command budgets are not reduced merely because managed artifacts are
 small; scripts may write elsewhere. These are estimates, not kernel-enforced
-write quotas. The shared admission
-mechanism checks physical capacity, remaining write commitments and memory;
-there is no fixed job-count limit. It preserves a 20 GiB internal reserve.
-When mounted, /Volumes/WillieDrive is included with a 100 GiB reserve. Other
-external working-directory mounts have a 1 GiB reserve. Explicit /Volumes path
-arguments also establish required mounts; a missing mount defers admission.
+write quotas and are not held against other jobs.
+.PP
+A job waits only for a free slot. There is one slot per four cores and per
+16 GiB of memory, whichever is fewer; MAX_RUNNING in the config file overrides
+it. Waiting is first come, first served, and status shows the position. Slots
+and queue places are kernel locks, so a crashed job or stale record holds
+neither. Commands that plainly run no build tool take no slot. A job still
+waiting after an hour fails with that reason.
+.PP
+Disk is decided once the slot is held. With the floor free (FLOOR_GIB, default
+5) the job starts. Below it one recovery pass of a few seconds runs, then the
+job starts or fails stating the free space, the need and what was recovered.
+An external working-directory mount or an explicit /Volumes path argument is a
+required mount with a 1 GiB floor; a missing one fails the job at once.
+Other jobs' records, retention inventory, a running recovery and busy locks
+never delay a start; what was ignored is logged in admission-notices.log.
 Scripts' hidden output paths cannot be inferred automatically.
 .PP
-Fitting jobs may run concurrently. Aged conflicting waiters reserve a later
-capacity opportunity. Recovery temporarily fences admission while active
-consumers drain. Progress depends on executors remaining available, consumers
-releasing resources and sufficient simultaneous capacity returning.
+A watchdog runs every minute. Below the low-water mark (LOW_WATER_GIB, default
+30) it recovers idle caches and the Gradle build outputs of idle git checkouts.
+It retires reservation records nobody owns and starts the oldest waiter if one
+is left beside a free slot.
 A controller outside the owned command group samples required filesystem
 reserves. Supported Linux systems can pause that group, request authorized
 reclamation and resume the same processes after capacity returns; parent-death

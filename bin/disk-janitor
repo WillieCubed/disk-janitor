@@ -46,6 +46,13 @@ AGENT_GUIDANCE_FILES=("$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md")
 # shellcheck source=/dev/null
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
+# Optional capacity policy from the config file reaches the runtime as environment.
+[ -z "${FLOOR_GIB:-}" ] || export DISK_JANITOR_FLOOR_GIB="$FLOOR_GIB"
+[ -z "${MAX_RUNNING:-}" ] || export DISK_JANITOR_MAX_RUNNING="$MAX_RUNNING"
+[ -z "${LOW_WATER_GIB:-}" ] || export DISK_JANITOR_LOW_WATER_GIB="$LOW_WATER_GIB"
+# Checkouts of the repositories under these roots have their idle build outputs recovered.
+DISK_JANITOR_PROJECT_DIRS="$(IFS=:; printf '%s' "${PROJECT_DIRS[*]}")"; export DISK_JANITOR_PROJECT_DIRS
+
 # env hooks (used by tests / CI; not for normal use)
 NO_SCHED="${DISK_JANITOR_NO_SCHED:-}"         # skip launchctl/systemctl/crontab activation
 DRY=""                                        # empty = normal; "1" = dry-run (keep empty so ${DRY:+…} works)
@@ -59,6 +66,24 @@ say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s\n' "${c_grn}✓${c_0} $*"; }
 warn() { printf '%s\n' "${c_yel}!${c_0} $*"; }
 err()  { printf '%s\n' "${c_red}✗${c_0} $*" >&2; }
+# The runtime needs Python 3.10+. A scheduler's minimal PATH finds the older system
+# interpreter first, so choose one explicitly instead of failing in the middle of a run.
+PYTHON=""
+find_python() {
+  [ -z "$PYTHON" ] || return 0
+  local candidate found
+  for candidate in ${DISK_JANITOR_PYTHON:+"$DISK_JANITOR_PYTHON"} python3 \
+      /Library/Frameworks/Python.framework/Versions/Current/bin/python3 /opt/homebrew/bin/python3 \
+      /usr/local/bin/python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+    found="$(type -P "$candidate" 2>/dev/null)" || continue  # a path, never the function below
+    if "$found" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' 2>/dev/null; then
+      PYTHON="$found"; return 0
+    fi
+  done
+  err "Python 3.10 or newer is required and none was found; set DISK_JANITOR_PYTHON to one"
+  return 2
+}
+python3() { find_python || return $?; command "$PYTHON" "$@"; }
 free_space() { df -Ph "$DATA_PATH" 2>/dev/null | awk 'NR==2 {print $4}'; }
 human() { du -sh "$1" 2>/dev/null | awk '{print $1}'; }
 tilde() { case "$1" in "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}";; *) printf '%s\n' "$1";; esac; }
@@ -346,8 +371,8 @@ cmd_uninstall() {
 }
 
 cmd_capacity() {
-  command -v python3 >/dev/null 2>&1 || { err "python3 is required for capacity admission"; return 2; }
-  DISK_JANITOR_RUNTIME_DIR="$(runtime_directory)" exec python3 -B - "$DATA_PATH" "$APP_HOME" "$@" 9<&0 <<'PY'
+  find_python || return $?
+  DISK_JANITOR_RUNTIME_DIR="$(runtime_directory)" exec "$PYTHON" -B - "$DATA_PATH" "$APP_HOME" "$@" 9<&0 <<'PY'
 import argparse, fcntl, hashlib, json, math, os, re, selectors, signal, stat, subprocess, sys, time, uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -355,8 +380,11 @@ import shutil
 sys.path.insert(0, os.environ.get('DISK_JANITOR_RUNTIME_DIR', str(Path(app_home) if 'app_home' in globals() else Path.cwd() / 'bin')))
 
 data_path, app_home, mode = sys.argv[1:4]
-p = argparse.ArgumentParser(description='Bounded admission, monitoring and recovery of authorized inactive compiler caches.')
-p.add_argument('--root-reserve-gib', type=float, default=20)
+p = argparse.ArgumentParser(description='Immediate admission above a free-space floor, monitoring, and recovery of authorized inactive caches.')
+def configured_floor():
+    try: return float(os.environ.get('DISK_JANITOR_FLOOR_GIB', 5))
+    except ValueError: return 5
+p.add_argument('--root-reserve-gib', type=float, default=configured_floor(), help='free-space floor (DISK_JANITOR_FLOOR_GIB, default 5): below it one bounded recovery runs, then the job starts or fails')
 p.add_argument('--warn-free-gib', type=float, default=100, help='early headroom warning only; 0 disables it without changing admission')
 p.add_argument('--planned-gib', type=float, default=6)
 p.add_argument('--max-growth-gib', type=float, default=6)
@@ -380,6 +408,11 @@ p.add_argument('--restartable', action='store_true', help='allow bounded coopera
 p.add_argument('--restart-kind', choices=['build','test','preview'], help='required disposable workflow declaration for --restartable; never deployments or migrations')
 p.add_argument('--recovery-after-seconds', type=float, default=30, help='minimum spacing between automatic recovery attempts')
 p.add_argument('--memory-gib', type=float, default=0, help='optional measured peak memory commitment')
+p.add_argument('--light', action='store_true', help=argparse.SUPPRESS)
+p.add_argument('--reclaim-seconds', type=float, default=2.5, help=argparse.SUPPRESS)
+p.add_argument('--lock-seconds', type=float, default=1, help=argparse.SUPPRESS)
+p.add_argument('--max-running', type=int, default=0, help=argparse.SUPPRESS)
+p.add_argument('--max-queue-seconds', type=float, default=3600, help='a job still waiting for a slot after this long fails instead of waiting indefinitely')
 p.add_argument('command', nargs=argparse.REMAINDER)
 a = p.parse_args(sys.argv[4:])
 if a.wait_seconds is None:a.wait_seconds=0 if mode=='admit' else 300
@@ -392,17 +425,43 @@ retention_identity = None
 warnings = []
 headroom_notices = set()
 reservation = None
+slot = None
 record = None
-admission_file = None
 registry = None
 result_file = None
 last_reason = None
 last_notice = 0
 job_started = time.monotonic()
-last_recovery = 0
 
 class CapacityUnavailable(RuntimeError):
     pass
+
+class Refused(CapacityUnavailable):
+    """The job cannot start now. It fails with this reason; it is never left queued."""
+
+def lock_within(handle, operation, seconds=None):
+    # Never queue behind a holder: take the lock within a bound or do without it.
+    end = time.monotonic() + (a.lock_seconds if seconds is None else seconds)
+    while True:
+        try:
+            fcntl.flock(handle, operation | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                return False
+            time.sleep(.01)
+
+def notice(message):
+    # State that was ignored for admission is recorded, never silently dropped.
+    if not a.quiet: print('Admission notice: ' + message, file=sys.stderr, flush=True)
+    try:
+        path = Path(app_home) / 'admission-notices.log'
+        if path.is_symlink(): return
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'a') as output:
+            output.write(json.dumps(dict(at=time.time(), owner=a.owner, job=a.job_id, notice=message)) + '\n')
+    except OSError:
+        pass
 
 # Preserve the installed shared-pool contract for future callers. This changes
 # neither ceilings nor existing reservations; explicit approved ceilings remain
@@ -411,8 +470,6 @@ def require_shared_retention_scope(artifact, aggregate):
     shared = Path('/Volumes/WillieDrive/CodexScratch').resolve()
     if artifact.resolve().is_relative_to(shared) and aggregate.resolve() != shared:
         raise RuntimeError('shared artifact pool requires --retention-root ' + str(shared) + '; private subtree quotas do not share its budget')
-
-proof_debt_marker = object()
 
 deadline = (time.monotonic() + a.deadline_seconds if a.deadline_seconds is not None else
             time.monotonic() + a.wait_seconds if mode == 'admit' else float('inf'))
@@ -457,7 +514,8 @@ def control_decision(require_accepted=False, mark_running=False):
         raise RuntimeError('job control requires a stable backend job ID')
     fence = path.parent / 'job.lock'
     with private_file(fence) as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        if not lock_within(handle, fcntl.LOCK_EX, 5):
+            raise RuntimeError('job control lock is held; launch and cancellation cannot be ordered')
         with private_file(path) as control:
             item = json.load(control)
         if (not isinstance(item, dict) or item.get('backend_job_id') != a.job_id
@@ -508,71 +566,35 @@ def check_cancelled():
     with control_decision():
         pass
 
-def maintenance_pending():
-    path = Path(app_home) / 'maintenance-intent.json'
-    try:
-        with private_file(path, private_parent=False) as handle:
-            intent = json.load(handle)
-        now = time.time()
-        if (intent.get('version') != 1 or not isinstance(intent.get('token'), str)
-                or not 0 <= now - intent['created'] < 125
-                or not now < intent['expires'] <= intent['created'] + 125):
-            return False
-        # The recovery mutex, not a persisted PID, proves a live intent owner.
-        fence = Path(app_home) / 'recovery.lock'
-        with fence.open('a') as handle:
-            try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError: return True
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError, TypeError, KeyError):
-        raise CapacityUnavailable('maintenance intent cannot be inspected safely')
-    return False
-
-def recover_capacity(reason):
-    global last_recovery
-    if mode != 'guard' or not any(word in reason.lower() for word in ('reserve', 'disk', 'memory', 'commitment')):
-        return
-    if time.monotonic() - last_recovery < a.recovery_after_seconds:
-        return
-    last_recovery = time.monotonic()
-    module = Path(os.environ['DISK_JANITOR_RUNTIME_DIR']) / 'recovery.py'
-    if not module.is_file() or module.is_symlink():
-        return
-    args = [sys.executable, '-B', str(module), '--apply', '--pressure-only', '--report', str(Path(app_home)/'recovery-last.json')]
-    if record is not None and record.get('state') == 'waiting':
-        args += ['--requester', record['id']]
-    try:
-        subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        pass  # Preserve the original waiter and continue capacity admission.
-
 def retry_capacity(check):
+    # Only a job's own handshake is awaited here: durable acceptance of its
+    # submission, or reattachment to its own live guardian. Capacity never queues.
     global last_reason, last_notice
-    delay = .1
+    delay = .01
     while True:
         check_cancelled()
         try:
             return check()
+        except Refused:
+            raise
         except CapacityUnavailable as error:
             check_cancelled()
-            recover_capacity(str(error))
             remaining = deadline - time.monotonic()
             if a.once or remaining <= 0:
                 raise
             now = time.monotonic()
             if not a.quiet and (str(error) != last_reason or now - last_notice >= min(30, max(1, a.wait_seconds))):
-                print('Queued; will resume automatically: ' + str(error), file=sys.stderr, flush=True)
+                print('Waiting: ' + str(error), file=sys.stderr, flush=True)
                 last_reason, last_notice = str(error), now
             time.sleep(min(delay, remaining))
-            delay = min(3, delay * 1.6)
+            delay = min(.25, delay * 1.6)
 
 def pressure(error, *, advisory=False):
     message = str(error)
     if message not in warnings:
         warnings.append(message)
         del warnings[:-16]
-        if not a.quiet: print(('Storage advisory: ' if advisory else 'Admission paused; running job preserved: ') + message, file=sys.stderr, flush=True)
+        if not a.quiet: print(('Storage advisory: ' if advisory else 'Capacity advisory; running job preserved: ') + message, file=sys.stderr, flush=True)
 
 def stop_owned():
     # Do not reap the leader before signalling its session: its PID then cannot
@@ -591,17 +613,17 @@ def stop_owned():
             pass
         child.wait(timeout=4)
 
-def allocated_bytes(path):
+def allocated_bytes(path, seconds=120):
     try:
         result = subprocess.run(['du', '-x', '-k', '-s', str(path)],
-                                capture_output=True, text=True, timeout=120)
+                                capture_output=True, text=True, timeout=seconds)
     except subprocess.TimeoutExpired as error:
-        raise CapacityUnavailable('retention inventory unknown: bounded 120s measurement timed out') from error
+        raise CapacityUnavailable('retention inventory unknown: bounded %gs measurement timed out' % seconds) from error
     if result.returncode:
         raise CapacityUnavailable('cannot measure retention safely')
     return int(result.stdout.split()[0]) * 1024
 
-def retained(force=False):
+def retained(force=False, seconds=120):
     if not a.artifact_root:
         return 0
     s = a.artifact_root.lstat()
@@ -654,7 +676,7 @@ def retained(force=False):
             os.replace(temp,status)
         write_status('measuring')
         try:
-            size=allocated_bytes(aggregate)
+            size=allocated_bytes(aggregate, seconds)
             end=aggregate.lstat()
             if aggregate.is_symlink() or (end.st_dev,end.st_ino)!=retention_identity:
                 raise RuntimeError('retention root changed during inventory')
@@ -670,18 +692,21 @@ def retained(force=False):
             pressure(CapacityUnavailable('historical retention threshold exceeded; advisory only; outputs preserved'), advisory=True)
         return size
 
+def headroom(path, device, reserve, free):
+    if not a.quiet and a.warn_free_gib and free < a.warn_free_gib * 2**30 and device not in headroom_notices:
+        headroom_notices.add(device)
+        print('Storage headroom warning: ' + str(path) +
+              ' has %.2f GiB free, below the %.2f GiB planning threshold; '
+              'hard reserve remains %.2f GiB. Review retained generated outputs before the safety floor is reached.' %
+              (free / 2**30, a.warn_free_gib, reserve), file=sys.stderr, flush=True)
+
 def observe(planned=0):
     result = {}
     for path, device, reserve in volumes:
         if path.is_symlink() or not os.path.ismount(path) or path.stat().st_dev != device:
             raise CapacityUnavailable('required mount missing or changed: ' + str(path))
         free = shutil.disk_usage(path).free
-        if not a.quiet and a.warn_free_gib and free < a.warn_free_gib * 2**30 and device not in headroom_notices:
-            headroom_notices.add(device)
-            print('Storage headroom warning: ' + str(path) +
-                  ' has %.2f GiB free, below the %.2f GiB planning threshold; '
-                  'hard reserve remains %.2f GiB. Review retained generated outputs before the safety floor is reached.' %
-                  (free / 2**30, a.warn_free_gib, reserve), file=sys.stderr, flush=True)
+        headroom(path, device, reserve, free)
         pending = planned.get(str(path), 0) if isinstance(planned, dict) else planned
         if free - pending < reserve * 2**30:
             raise CapacityUnavailable('free-space reserve admission failed: ' + str(path))
@@ -729,11 +754,9 @@ try:
         if not math.isfinite(reserve) or reserve < 0:
             raise RuntimeError('invalid volume reserve')
         if not mount.is_absolute() or mount.is_symlink():raise RuntimeError('unsafe external mount path: '+name)
-        def mounted():
-            if not os.path.ismount(mount):raise CapacityUnavailable('required external mount is absent: '+name)
-            return mount.stat().st_dev
-        device=retry_capacity(mounted)
-        volumes.append((mount, device, reserve))
+        if mode == 'admit' and not os.path.ismount(mount):
+            raise CapacityUnavailable('required external mount is absent: '+name)
+        volumes.append((mount, mount.stat().st_dev if os.path.ismount(mount) else None, reserve))
     write_budgets = {}
     for name, amount in a.write_budget:
         if name not in {str(path) for path, _, _ in volumes} or name in write_budgets:
@@ -767,6 +790,9 @@ try:
             if candidate.stat().st_size > 4096 or json.loads(candidate.read_text()).get('owner') != a.owner:
                 raise RuntimeError('artifact owner mismatch; existing outputs preserved')
         if mode == 'admit':retry_capacity(retained)
+    for value in (a.reclaim_seconds, a.lock_seconds, a.max_queue_seconds, a.max_running):
+        if not math.isfinite(value) or value < 0:
+            raise RuntimeError('reserve and budget values must be finite and nonnegative')
     if mode == 'admit':
         before=retry_capacity(lambda:observe({str(path):write_budgets.get(str(path),a.planned_gib*2**30) for path,_,_ in volumes}))
         print(json.dumps(dict(admitted=True, free_bytes=before, planned_gib=a.planned_gib)))
@@ -785,17 +811,9 @@ try:
     registry=home/'guard-reservations'
     registry.mkdir(mode=0o700,exist_ok=True)
     if registry.is_symlink():raise RuntimeError('reservation directory must not be a symlink')
-    mutex=home/'admission.lock'
     legacy=home/'guard.lock'
-    if mutex.is_symlink() or legacy.is_symlink():raise RuntimeError('admission locks must not be symlinks')
-    admission_file=mutex.open('a')
+    if legacy.is_symlink():raise RuntimeError('admission locks must not be symlinks')
     lock=legacy.open('a')
-
-    @contextmanager
-    def atomic():
-        fcntl.flock(admission_file,fcntl.LOCK_EX)
-        try:yield
-        finally:fcntl.flock(admission_file,fcntl.LOCK_UN)
 
     command_hash=hashlib.sha256(json.dumps([command,os.getcwd(),a.owner,str(a.artifact_root)]).encode()).hexdigest()
     job_id=a.job_id or uuid.uuid4().hex
@@ -806,109 +824,54 @@ try:
     def write_record():
         reservation.seek(0);reservation.truncate();json.dump(record,reservation);reservation.flush()
 
-    def proof_debt(item):
-        # Settlement debt survives held record locks, missing result files,
-        # missing/replaced mounts and guard crashes. Never imply future RAM/IO.
-        debt=dict(item,state='running',memory=0)
-        debt['_proof_debt_marker']=proof_debt_marker  # In-memory only; registry JSON cannot forge object identity.
-        debt['volumes']=[dict(v,budget=0) for v in item['volumes']]
-        return debt
-
-    def read_jobs():
-        active=[]
-        for path in registry.glob('*.json'):
-            if path.is_symlink():raise RuntimeError('unsafe reservation file')
-            handle=path.open('r+')
-            try:
-                try:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                except BlockingIOError:
-                    try:item=json.load(handle)
-                    except ValueError:raise CapacityUnavailable('reservation state unavailable; owner retained')
-                    if item['id']!=job_id:active.append(proof_debt(item) if item.get('retention_unsettled') or item.get('state') in {'settling','completed'} else item)
-                    continue
-                item=json.load(handle)
-                outcome=registry/(item['id']+'.result')
-                captured=registry/(item['id']+'.outcome')
-                if captured.exists() and not captured.is_symlink():
-                    known=json.loads(captured.read_text())
-                    if (known.get('owner')==item['owner'] and known.get('command_hash')==item['command_hash']
-                            and type(known.get('exit_code')) is int and 0<=known['exit_code']<=255):
-                        prior=json.loads(outcome.read_text()) if outcome.exists() and not outcome.is_symlink() else None
-                        if prior is None or prior.get('status')=='outcome-uncertain':durable_result(outcome,known)
-                # A supervisor's result does not prove that final writes were
-                # inventoried. Guardian-crash completions enter the same debt
-                # path, after the original process group has actually retired.
-                if item.get('artifact') and outcome.exists() and not outcome.is_symlink():
-                    terminal=json.loads(outcome.read_text())
-                    if terminal.get('command_hash')==item['command_hash'] and terminal.get('owner')==item['owner']:
-                        pgid=item.get('child')
-                        live=False
-                        if pgid:
-                            try:os.killpg(pgid,0);live=True
-                            except ProcessLookupError:pass
-                            except PermissionError:live=True
-                        if live:
-                            item['state']='running';active.append(item);continue
-                        if not item.get('finished'):
-                            item['finished']=time.time()
-                            item['retention_unsettled']=True
-                            handle.seek(0);handle.truncate();json.dump(item,handle);handle.flush()
-                        else:item['retention_unsettled']=True
-                if item.get('retention_unsettled'):
-                    covered=False
-                    try:
-                        aggregate=Path(item['retention']).resolve(strict=True)
-                        info=aggregate.stat()
-                        cache=home/('retention-'+hashlib.sha256(str(aggregate).encode()).hexdigest()[:20]+'.json')
-                        measured=json.loads(cache.read_text())
-                        saved=json.loads(outcome.read_text()) if not outcome.is_symlink() else {}
-                        expected=item.get('retention_identity')
-                        covered=(expected==[info.st_dev,info.st_ino] and measured.get('strategy')=='single-flight-v1' and measured['identity']==expected and measured.get('measurement_started',0)>=item['finished'] and saved.get('command_hash')==item['command_hash'] and saved.get('owner')==item['owner'])
-                    except (OSError,ValueError,KeyError,TypeError):pass
-                    if covered:path.unlink()
-                    else:active.append(proof_debt(item))
-                    continue
-                if outcome.exists() and not outcome.is_symlink():
-                    saved=json.loads(outcome.read_text())
-                    if saved.get('command_hash')==item['command_hash'] and saved.get('owner')==item['owner']:
-                        path.unlink();continue
-                pgid=item.get('child')
-                if item.get('state')=='running' and pgid:
-                    try:os.killpg(pgid,0)
-                    except ProcessLookupError:pass
-                    except PermissionError:raise CapacityUnavailable('reservation liveness unknown for '+item['owner'])
-                    else:
-                        active.append(item);continue
-                # Keep a durable uncertain outcome so a later reattachment cannot
-                # silently repeat a command whose side effects are unknown.
-                if item.get('state')=='running' and not outcome.exists():
-                    temporary=outcome.with_name(outcome.name+'.'+str(os.getpid()))
-                    durable_result(outcome,{'owner':item['owner'],'command_hash':item['command_hash'],'exit_code':125,'status':'outcome-uncertain'})
-                if item.get('artifact') and item.get('state')=='running':
-                    # A guardian crash without any result is still an admitted
-                    # writer. Preserve debt until post-observation inventory.
-                    item['finished']=time.time();item['retention_unsettled']=True
-                    handle.seek(0);handle.truncate();json.dump(item,handle);handle.flush()
-                    active.append(proof_debt(item));continue
-                # Only verified abandoned registry metadata is removed, never outputs.
-                path.unlink()
-            except (FileNotFoundError,ValueError,KeyError,TypeError) as error:
-                # Ambiguous admitted writers/results are not disposable metadata.
-                # Preserve the record and fail admission closed for owner review.
-                raise CapacityUnavailable('reservation or outcome unknown; metadata preserved: '+str(path)) from error
-            finally:handle.close()
-        return active
+    def retire_records():
+        # This job's reservation stays, locked, until the process is gone: observers
+        # treat that lock as execution still ending. Records other guardians left
+        # behind are retired here, so the registry stays small without any scheduler.
+        try:
+            from capacity import sweep_registry
+            sweep_registry(home)
+        except (OSError,ValueError,KeyError,TypeError,ImportError):pass
 
     def claim():
         global reservation,record
-        with atomic():
-            if job_path.is_symlink() or result_file.is_symlink():raise RuntimeError('unsafe job path')
-            descriptor=os.open(job_path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        if job_path.is_symlink() or result_file.is_symlink():raise RuntimeError('unsafe job path')
+        raw=''
+        try:
+            descriptor=os.open(job_path,os.O_RDWR|os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if result_file.exists():
+                saved=json.loads(result_file.read_text())
+                if saved['owner']!=a.owner or saved['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
+                if not a.quiet: print('Previously completed job '+job_id+'; command was not repeated',flush=True)
+                raise SystemExit(saved['exit_code'])
+            # Publish a new reservation already locked and complete enough to own:
+            # no reader ever sees it empty or unowned, so no shared mutex is needed.
+            staged=registry/(job_id+'.claim-'+os.urandom(8).hex())
+            descriptor=os.open(staged,os.O_CREAT|os.O_EXCL|os.O_RDWR|os.O_NOFOLLOW,0o600)
+            try:
+                fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                os.link(staged,job_path)
+            except FileExistsError:
+                os.close(descriptor)
+                raise CapacityUnavailable('reattaching to accepted job '+job_id+' owned by '+a.owner)
+            finally:os.unlink(staged)
+            reservation=os.fdopen(descriptor,'a+')
+        else:
             reservation=os.fdopen(descriptor,'a+')
             try:fcntl.flock(reservation,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:
-                reservation.seek(0);saved=json.load(reservation);reservation.close();reservation=None
-                if saved['owner']!=a.owner or saved['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
+                reservation.seek(0)
+                try:saved=json.load(reservation)
+                except ValueError:saved=None
+                reservation.close();reservation=None
+                if saved is not None and (saved['owner']!=a.owner or saved['command_hash']!=command_hash):raise RuntimeError('job identity mismatch')
+                raise CapacityUnavailable('reattaching to accepted job '+job_id+' owned by '+a.owner)
+            try:current=job_path.lstat().st_ino
+            except FileNotFoundError:current=None
+            if os.fstat(reservation.fileno()).st_ino!=current:
+                # Retired between open and lock; the next attempt reads its result.
+                reservation.close();reservation=None
                 raise CapacityUnavailable('reattaching to accepted job '+job_id+' owned by '+a.owner)
             if result_file.exists():
                 saved=json.loads(result_file.read_text())
@@ -916,117 +879,142 @@ try:
                 if not a.quiet: print('Previously completed job '+job_id+'; command was not repeated',flush=True)
                 raise SystemExit(saved['exit_code'])
             reservation.seek(0);raw=reservation.read()
-            if raw:
-                previous=json.loads(raw)
-                if previous['owner']!=a.owner or previous['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
-                if previous.get('state')=='running':
-                    with control_decision() as control:
-                        if (not a.job_control_file or control.get('execution_committed') or previous.get('child') is not None):
-                            raise RuntimeError('previous command outcome is uncertain; outputs retained for '+job_id)
-            record={'id':job_id,'owner':a.owner,'pid':os.getpid(),'command_hash':command_hash,
-                    'state':'waiting','created':a.submitted_at if a.submitted_at is not None else previous.get('created',time.time()) if raw else time.time(),'budget':a.planned_gib*2**30,
-                    'retention_limit':a.max_retained_gib*2**30,'memory':a.memory_gib*2**30,'class':a.work_class,'artifact':str(a.artifact_root.resolve()) if a.artifact_root else None,
-                    'retention':str((a.retention_root or a.artifact_root).resolve()) if a.artifact_root else None,'retention_identity':list(retention_identity) if a.artifact_root else None,'volumes':[{'path':str(p),'device':d,'reserve':r*2**30,'budget':write_budgets.get(str(p),a.planned_gib*2**30)} for p,d,r in volumes],
-                    'child':None,'runtime_file':str(registry/(job_id+'.runtime')),'consumed':{},'restartable':a.restartable,'restart_kind':a.restart_kind,'preemptions':0}
-            write_record()
+        if raw:
+            previous=json.loads(raw)
+            if previous['owner']!=a.owner or previous['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
+            if previous.get('state')=='running':
+                with control_decision() as control:
+                    if (not a.job_control_file or control.get('execution_committed') or previous.get('child') is not None):
+                        raise RuntimeError('previous command outcome is uncertain; outputs retained for '+job_id)
+        # Estimates are recorded for the owner, never held against other jobs: budget
+        # and memory stay zero so no reader counts this job as a claim on capacity.
+        record={'id':job_id,'owner':a.owner,'pid':os.getpid(),'command_hash':command_hash,
+                'state':'waiting','created':a.submitted_at if a.submitted_at is not None else previous.get('created',time.time()) if raw else time.time(),'budget':0,'planned':a.planned_gib*2**30,
+                'retention_limit':a.max_retained_gib*2**30,'memory':0,'class':a.work_class,'artifact':str(a.artifact_root.resolve()) if a.artifact_root else None,
+                'retention':str((a.retention_root or a.artifact_root).resolve()) if a.artifact_root else None,'retention_identity':list(retention_identity) if a.artifact_root else None,'volumes':[{'path':str(p),'device':d,'reserve':r*2**30,'budget':0} for p,d,r in volumes],
+                'child':None,'runtime_file':str(registry/(job_id+'.runtime')),'consumed':{},'restartable':a.restartable,'restart_kind':a.restart_kind,'preemptions':0}
+        write_record()
     retry_capacity(claim)
 
-    def memory_available():
-        if sys.platform.startswith('linux'):
-            data=Path('/proc/meminfo').read_text();return int(re.search(r'MemAvailable:\s+(\d+)',data)[1])*1024
-        if sys.platform=='darwin':
-            result=subprocess.run(['vm_stat'],capture_output=True,text=True,timeout=2).stdout
-            page=int(re.search(r'page size of (\d+)',result)[1])
-            available=sum(int(re.search(r'Pages '+key+r':\s+(\d+)',result)[1]) for key in ['free','inactive','speculative'])
-            return page*available
-        return None
+    def free_bytes():
+        free={}
+        for path,device,reserve in volumes:
+            if device is None or path.is_symlink() or not os.path.ismount(path) or path.stat().st_dev!=device:
+                raise Refused('required mount is absent or changed: '+str(path))
+            free[str(path)]=shutil.disk_usage(path).free
+        return free
 
-    def volume_budget(item, device):
-        return max((v.get('budget',item['budget']) for v in item['volumes'] if v['device']==device),default=0)
+    def below_floor(free):
+        return {str(path):reserve*2**30 for path,_,reserve in volumes if free[str(path)]<reserve*2**30}
 
-    def volume_consumed(item, device):
-        return max((item.get('consumed',{}).get(v['path'],0) for v in item['volumes'] if v['device']==device),default=0)
+    def reclaim(short):
+        # One synchronous pass of the existing recovery, bounded in time. It owns
+        # classification, activity proof and deletion; this job only waits briefly.
+        module=Path(os.environ['DISK_JANITOR_RUNTIME_DIR'])/'recovery.py'
+        if not module.is_file() or module.is_symlink():return None
+        args=[sys.executable,'-B',str(module),'--apply','--pressure-only','--time-limit',str(a.reclaim_seconds),
+              '--report',str(home/'recovery-last.json')]
+        for name,required in short.items():args+=['--need',name+'='+str(int(required))]
+        try:
+            done=subprocess.run(args,capture_output=True,text=True,timeout=a.reclaim_seconds+1.5)
+            return int(json.loads(done.stdout)['removed_allocated_bytes'])
+        except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError):return None
 
-    def pending_retention(item):
-        # Physical cache growth on another filesystem is not proof-retention settlement.
-        # Keep the full registered proof commitment until the job is terminal.
-        return item['budget']
+    def memory_critical():
+        if sys.platform!='darwin':return False
+        try:
+            level=subprocess.run(['sysctl','-n','kern.memorystatus_vm_pressure_level'],capture_output=True,text=True,timeout=1)
+        except (OSError,subprocess.SubprocessError):return False
+        return level.returncode==0 and level.stdout.strip().isdigit() and int(level.stdout.strip())>=4
 
-    def eligible(item,active,free,retained_bytes):
-        if item.get('yield_until',0)>time.time():return 'cooperative preemption cooldown'
-        # Estimate overruns remain visible to their owner. They are not a global
-        # lock: actual free bytes, outstanding claims and reserves still decide.
-        for volume in item['volumes']:
-            key=volume['path'];claims=sum(max(0,volume_budget(x,volume['device'])-volume_consumed(x,volume['device'])) for x in active)
-            reserve=max([volume['reserve']]+[v['reserve'] for x in active for v in x['volumes'] if v['device']==volume['device']])
-            if key not in free:return 'required volume is unavailable: '+key
-            if free[key]-claims-volume_budget(item,volume['device'])<reserve:return 'disk reserve/pending-write commitments on '+key
-        if item.get('artifact'):
-            for running in active:
-                other=running.get('artifact')
-                if other and os.path.commonpath([item['artifact'],other]) in (item['artifact'],other):
-                    return 'artifact directory overlaps active owner '+running['owner']
-        # Historical retention and proof-debt records remain preserved metadata.
-        # Admission uses physical free bytes and outstanding per-volume writes
-        # above; historical totals must not veto otherwise safe work.
-        if sys.platform=='darwin':
-            pressure=subprocess.run(['sysctl','-n','kern.memorystatus_vm_pressure_level'],capture_output=True,text=True,timeout=2)
-            if pressure.returncode==0 and pressure.stdout.strip().isdigit() and int(pressure.stdout.strip())>=4:return 'measured critical memory pressure'
-        available=memory_available() if item['memory'] else None
-        if available is not None and available-sum(x['memory'] for x in active)<item['memory']:return 'measured available memory/pending commitments'
-        return None
-
-    def conflicts(left, right):
-        # Backfill is safe only when it cannot keep an aged demand from draining.
-        # Jobs declaring zero disk writes do not occupy that disk resource.
-        disks = {v['device'] for v in left['volumes'] if volume_budget(left, v['device']) > 0}
-        return (bool(disks & {v['device'] for v in right['volumes'] if volume_budget(right, v['device']) > 0})
-                or (left['memory'] > 0 and right['memory'] > 0))
+    def wait_for_slot():
+        # The only reason a job waits: every slot is held by a running job. Slots are
+        # kernel locks and the queue is locked tickets, so nothing stale holds either.
+        from capacity import slot_limit, take_slot, join_queue, waiting_tickets
+        from runnerpools_bridge import UserBridge, BridgeUnavailable
+        limit=a.max_running or slot_limit()
+        asked=0
+        def runners():
+            # Every CI runner the RunnerPools broker has admitted is work this machine
+            # is running, so it takes a slot. One slot always stays open to local jobs:
+            # a commitment the broker never withdrew cannot hold all of them.
+            try:return min(limit-1,len(UserBridge().claims(guard_home=home)))
+            except BridgeUnavailable as error:
+                if str(error) not in warnings:warnings.append(str(error));notice('RunnerPools commitments ignored: '+str(error))
+                return 0
+        submitted=record['created']
+        # A job that yielded its slot queues again from now, behind the job it yielded to.
+        ticket,ticket_fd=join_queue(home,time.time() if record.get('preemptions') else submitted,job_id)
+        granted=ticket.with_name(ticket.name+'.go')
+        try:
+            while True:
+                check_cancelled()
+                ahead=[name for name in waiting_tickets(home) if name<ticket.name]
+                ci=runners()
+                if not ahead or granted.exists():
+                    held=take_slot(home,limit-ci)
+                    if held is not None:return held
+                waited=time.time()-submitted
+                if a.once or time.monotonic()>=deadline or waited>a.max_queue_seconds:
+                    raise Refused('no free slot after %.0f s: all %d slots are running jobs%s and %d earlier jobs are waiting'
+                                  % (max(0,waited),limit,' (%d held by RunnerPools CI runners)'%ci if ci else '',len(ahead)))
+                os.utime(ticket_fd)  # Still polling: jobs behind this one know it is live.
+                if a.work_class=='feedback' and not ahead and time.monotonic()-asked>=1:
+                    # Existing contract: an explicitly restartable build may yield its
+                    # slot to waiting feedback work. Only its own guardian stops it.
+                    asked=time.monotonic()
+                    try:
+                        from capacity import request_preemption
+                        request_preemption(home,job_id)
+                    except (OSError,ValueError,KeyError,TypeError,AttributeError,ImportError):pass
+                time.sleep(.25)
+        finally:
+            for name in (ticket,granted):
+                try:name.unlink()
+                except OSError:pass
+            os.close(ticket_fd)
 
     def acquire():
-        global before,marker
-        # Existing exclusive holders finish naturally. Shared v2 fences also keep
-        # old unaccounted guard binaries from overlapping admitted v2 work.
-        try:fcntl.flock(lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
-        except BlockingIOError:raise CapacityUnavailable('active legacy exclusive guard; awaiting its safe natural release')
-        try:
-            with atomic():
-                with control_decision(require_accepted=True):pass
-                if maintenance_pending():raise CapacityUnavailable('cache maintenance drain in progress')
-                size=retained()
-                record['retained_bytes']=size;write_record();jobs=read_jobs();active=[j for j in jobs if j['state']=='running']
-                from runnerpools_bridge import UserBridge, BridgeUnavailable
-                try:active.extend(UserBridge().claims(guard_home=home))
-                except BridgeUnavailable as error:raise CapacityUnavailable(str(error)) from error
-                # Reconcile claims and sample physical bytes inside one admission
-                # decision. A sample obtained before this mutex can be stale.
-                free=observe()
-                own_reason=eligible(record,active,free,size)
-                if own_reason:raise CapacityUnavailable(own_reason+'; active owners: '+(', '.join(j['owner'] for j in active) or 'none'))
-                waiters=[j for j in jobs if j['state']=='waiting']+[record]
-                def order(j):
-                    age=time.time()-j['created'];return (-1 if age>60 else 0 if j['class']=='feedback' else 1,j['created'],j['id'])
-                ordered=sorted(waiters,key=order)
-                aged=[j for j in ordered if time.time()-j['created']>60]
-                # Reserve the oldest aged demand even while it does not fit.
-                # Independent disks / zero-write work keep making progress.
-                barrier=aged[0] if aged else None
-                if barrier and barrier['id']!=job_id and conflicts(record,barrier):
-                    raise CapacityUnavailable('draining resources for aged job '+barrier['owner'])
-                fitting=[j for j in ordered if (not barrier or j['id']==barrier['id'] or not conflicts(j,barrier)) and not eligible(j,active,free,size if j.get('retention')==record.get('retention') else j.get('retained_bytes',float('inf')))]
-                if fitting and fitting[0]['id']!=job_id:raise CapacityUnavailable('earlier eligible feedback/aged job '+fitting[0]['owner'])
-                record['state']='running';write_record();before=free
-                marker=candidate if a.artifact_root else None
-                save(None,'running')
-        except BaseException:
-            fcntl.flock(lock,fcntl.LOCK_UN);raise
+        # Wait only for a slot. Other jobs' records, retention inventory, a running
+        # recovery and busy locks are never consulted, and disk is decided once the
+        # slot is held: the job starts, or it fails with the reason it cannot.
+        global before,marker,slot
+        with control_decision(require_accepted=True):pass
+        if not a.light and slot is None:slot=wait_for_slot()
+        if a.light:
+            # No build tool runs, so no headroom is required and no cache is in use.
+            free={str(path):shutil.disk_usage(path).free for path,device,_ in volumes if device is not None}
+        else:
+            free=free_bytes()
+            short=below_floor(free)
+            if short:
+                earlier=free
+                removed=reclaim(short)
+                free=free_bytes()
+                short=below_floor(free)
+                if short:
+                    name=sorted(short)[0]
+                    freed=removed if removed is not None else max(0,free[name]-earlier[name])
+                    raise Refused('insufficient disk: %.2f GiB free on %s, need %.2f GiB; reclaim freed %.2f GiB'
+                                  % (free[name]/2**30,name,short[name]/2**30,freed/2**30))
+            for path,device,reserve in volumes:headroom(path,device,reserve,free[str(path)])
+            if memory_critical():
+                raise Refused('critical memory pressure: the machine has no memory to start more work')
+            # The shared fence only keeps guard binaries that predate per-unit activity
+            # proof from overlapping this job. Recovery no longer needs it to run.
+            if not lock_within(lock,fcntl.LOCK_SH):
+                notice('cache fence is held exclusively; started without it')
+        record['state']='running';write_record();before=free
+        marker=candidate if a.artifact_root else None
+        save(None,'running')
     retry_capacity(acquire)
     while True:
         check_cancelled()
         baseline_artifact=0
         if a.artifact_root:
-            baseline_artifact=retry_capacity(lambda: allocated_bytes(a.artifact_root))
-        if not a.quiet: print('Admitted '+job_id+' ('+a.owner+'); compatible jobs may run concurrently',flush=True)
+            try:baseline_artifact=allocated_bytes(a.artifact_root,5)
+            except CapacityUnavailable as error:pressure(error,advisory=True)
+        if not a.quiet: print('Admitted '+job_id+' ('+a.owner+')',flush=True)
         environment = dict(os.environ)
         if a.artifact_root:
             environment['DISK_JANITOR_ARTIFACT_ROOT'] = str(a.artifact_root.resolve())
@@ -1150,8 +1138,8 @@ os.killpg(os.getpgrp(),signal.SIGKILL)
         module=Path(os.environ.get('DISK_JANITOR_RUNTIME_DIR',str(Path.cwd()/'bin')))/'capacity.py'
         if not module.is_file() or module.is_symlink():raise RuntimeError('owned runtime controller is unavailable')
         start_read,start_write=os.pipe()
-        inherited=(write_fd,reservation.fileno(),lock.fileno())+((log_descriptor,) if log_descriptor>=0 else ())
-        runtime_config={'volumes':[dict(path=str(path),device=device,reserve=reserve*2**30,mount_required=True) for path,device,reserve in volumes],
+        inherited=(write_fd,reservation.fileno(),lock.fileno())+((log_descriptor,) if log_descriptor>=0 else ())+((slot,) if slot is not None else ())
+        runtime_config={'volumes':[dict(path=str(path),device=device,reserve=0 if a.light else reserve*2**30,mount_required=True) for path,device,reserve in volumes if device is not None],
                         'runtime_file':str(registry/(job_id+'.runtime')),'outcome_file':str(registry/(job_id+'.outcome')),
                         'result_file':str(result_file),'guard_fd':lock.fileno(),'start_fd':start_read,
                         'control_file':str(a.job_control_file or ''),'foreground_stdio':a.foreground_stdio,
@@ -1167,8 +1155,7 @@ os.killpg(os.getpgrp(),signal.SIGKILL)
         os.close(start_read)
         if log_descriptor>=0:os.close(log_descriptor)
         os.close(write_fd)
-        with atomic():
-            record['child']=child.pid;write_record()
+        record['child']=child.pid;write_record()
         os.write(start_write,b'1');os.close(start_write)
         watcher = selectors.DefaultSelector()
         watcher.register(read_fd, selectors.EVENT_READ)
@@ -1214,11 +1201,10 @@ os.killpg(os.getpgrp(),signal.SIGKILL)
                 retained()
                 if a.artifact_root:
                     consumed=max(0,allocated_bytes(a.artifact_root)-baseline_artifact)
-                    with atomic():
-                        record['overrun']=consumed>record['budget']
-                        for volume in record['volumes']:
-                            if volume['device']==identity[0]:record['consumed'][volume['path']]=min(record['budget'],consumed)
-                        write_record()
+                    record['overrun']=consumed>record['planned']
+                    for volume in record['volumes']:
+                        if volume['device']==identity[0]:record['consumed'][volume['path']]=min(record['planned'],consumed)
+                    write_record()
             except (CapacityUnavailable, subprocess.TimeoutExpired) as error:
                 pressure(error)
         watcher.close()
@@ -1226,18 +1212,19 @@ os.killpg(os.getpgrp(),signal.SIGKILL)
         stop_owned()
         if not result.get('_preempted'):
             break
-        with atomic():
-            record['preemptions']=record.get('preemptions',0)+1
-            record['state']='waiting';record['child']=None;record['yield_until']=time.time()+1
-            record['consumed']={};write_record()
-            # Explicit cooperative retries have distinct attempt receipts. All
-            # previous writers are reaped before removing the current-attempt view.
-            for suffix in ('.outcome','.result'):
-                prior=registry/(job_id+suffix)
-                if prior.exists():
-                    saved=json.loads(prior.read_text())
-                    if saved.get('owner')!=a.owner or saved.get('command_hash')!=command_hash:raise RuntimeError('preemption outcome identity mismatch')
-                    os.replace(prior,registry/(job_id+'.preempt-'+str(record['preemptions'])+suffix))
+        if slot is not None:
+            os.close(slot);slot=None
+        record['preemptions']=record.get('preemptions',0)+1
+        record['state']='waiting';record['child']=None;record['yield_until']=time.time()+1
+        record['consumed']={};write_record()
+        # Explicit cooperative retries have distinct attempt receipts. All
+        # previous writers are reaped before removing the current-attempt view.
+        for suffix in ('.outcome','.result'):
+            prior=registry/(job_id+suffix)
+            if prior.exists():
+                saved=json.loads(prior.read_text())
+                if saved.get('owner')!=a.owner or saved.get('command_hash')!=command_hash:raise RuntimeError('preemption outcome identity mismatch')
+                os.replace(prior,registry/(job_id+'.preempt-'+str(record['preemptions'])+suffix))
         # The same owning guardian retries its exact opt-in command after teardown.
         # No other agent signals a process or replays an uncertain completed action.
         retry_capacity(acquire)
@@ -1246,19 +1233,19 @@ os.killpg(os.getpgrp(),signal.SIGKILL)
     if 'error' in result and not a.job_log_file:
         print('Unable to start command: '+result['error'],file=sys.stderr)
     code = result['exit_code']
-    with atomic():
-        record['finished']=time.time()
-        record['retention_unsettled']=False
-        try:
-            observe()
-            retained(force=True) # Must begin after final writes; no cached settlement.
-        except (CapacityUnavailable, subprocess.TimeoutExpired) as error:
-            pressure(error)
-            record['retention_unsettled']=bool(a.artifact_root)
-        save(code, 'completed; capacity review required' if warnings else
-             'completed' if code == 0 else 'command failed; outputs retained')
-        record['state']='settling' if record['retention_unsettled'] else 'completed';write_record()
-        durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':code if code>=0 else 128-code})
+    record['finished']=time.time()
+    record['retention_unsettled']=False
+    try:
+        # Advisory inventory after the final writes. It is bounded and settles nothing:
+        # no later job consults it before starting.
+        retained(force=True,seconds=5)
+    except (CapacityUnavailable, subprocess.TimeoutExpired) as error:
+        pressure(error,advisory=True)
+    save(code, 'completed; capacity review required' if warnings else
+         'completed' if code == 0 else 'command failed; outputs retained')
+    record['state']='completed';write_record()
+    durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':code if code>=0 else 128-code})
+    retire_records()
     raise SystemExit(code if code >= 0 else 128 - code)
 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
     cancellation_teardown_confirmed=False
@@ -1281,15 +1268,25 @@ except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardI
         except (OSError,ValueError,RuntimeError) as cancellation_error:
             print('ERROR: could not publish no-launch cancellation: '+str(cancellation_error),file=sys.stderr)
     if isinstance(error,Cancelled) and record is not None and reservation is not None:
-        with atomic():
-            record['state']='cancelled';record['cancellation_teardown_confirmed']=cancellation_teardown_confirmed;write_record()
-            durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':143})
+        record['state']='cancelled';record['cancellation_teardown_confirmed']=cancellation_teardown_confirmed;write_record()
+        durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':143})
+    if isinstance(error,Refused) and record is not None and reservation is not None and child is None:
+        # A refusal is a terminal outcome with its reason, not a wait.
+        try:
+            record['state']='refused';write_record()
+            if not result_file.exists():
+                durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':75,'status':'refused','no_launch':True,'reason':str(error)})
+            if a.job_log_file:
+                descriptor=os.open(a.job_log_file,os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW)
+                with os.fdopen(descriptor,'a') as output:output.write('Not started: '+str(error)+'\n')
+        except (OSError,ValueError,RuntimeError) as refusal_error:
+            print('ERROR: could not publish refusal: '+str(refusal_error),file=sys.stderr)
     raise SystemExit(143 if isinstance(error,Cancelled) else 75 if isinstance(error, CapacityUnavailable) else 125)
 finally:
+    if slot is not None:
+        os.close(slot)
     if reservation is not None:
         reservation.close()
-    if admission_file is not None:
-        admission_file.close()
     if lock is not None:
         lock.close()
 PY
@@ -1308,12 +1305,22 @@ with Path(path).open('wb') as stream:
         ProgramArguments=[binary, 'reclaim', '--apply', '--pressure-only', '--report', home + '/reclaim-last.json'],
         StartInterval=3600, ProcessType='Background', LowPriorityIO=True,
         StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
+# Every minute: retire dead registry records and restore free space to the low-water
+# mark, so a starting job rarely meets its floor. It takes no lock a job waits on.
+with Path(path).with_name('disk-janitor-watchdog.plist').open('wb') as stream:
+    plistlib.dump(dict(Label='disk-janitor-watchdog',
+        ProgramArguments=[binary, 'recover', '--watchdog'],
+        StartInterval=60, ProcessType='Background', LowPriorityIO=True,
+        StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
 PY
   if [ -z "$NO_SCHED" ]; then
-    launchctl unload "$reclaim_plist" 2>/dev/null || true
-    launchctl load "$reclaim_plist" || return 1
+    local plist
+    for plist in "$reclaim_plist" "${reclaim_plist%-reclaim.plist}-watchdog.plist"; do
+      launchctl unload "$plist" 2>/dev/null || true
+      launchctl load "$plist" || return 1
+    done
   fi
-  ok "hourly reviewed-artifact cleanup configured"
+  ok "hourly reviewed-artifact cleanup and one-minute watchdog configured"
 }
 
 cmd_recover() {
@@ -1881,6 +1888,10 @@ Full manual: man $APP_NAME
 EOF
 }
 
+case "${1:-help}" in
+  help|-h|--help|version|config|guidance) ;;
+  *) find_python || exit $? ;;
+esac
 case "${1:-help}" in
   install)   shift; cmd_install "$@" ;;
   uninstall) cmd_uninstall "${2:-}" ;;

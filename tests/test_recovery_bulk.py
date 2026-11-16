@@ -71,9 +71,9 @@ class BulkRecoveryTests(unittest.TestCase):
         paths=[self.transform(n) for n in range(512)];registry=self.app/'guard-reservations';registry.mkdir()
         p=registry/'waiting.json';p.write_text(json.dumps({'id':'waiting','owner':'fixture','state':'waiting','created':1,'memory':0,'budget':1000000000,'consumed':{},'volumes':[{'path':str(self.home),'device':self.home.stat().st_dev,'reserve':20,'budget':1000000000}]}))
         original=self.r.pressure_demand;calls=[]
-        def measured(app):calls.append(True);return original(app)
+        def measured(*args,**kw):calls.append(True);return original(*args,**kw)
         with p.open('a+') as lease,patch.object(self.r,'pressure_demand',side_effect=measured),patch.object(self.r.shutil,'disk_usage',side_effect=lambda _:SimpleNamespace(free=40 if any(x.exists() for x in paths) else 2000000000)),patch.object(self.r.os.path,'ismount',return_value=True):
-            fcntl.flock(lease,fcntl.LOCK_EX);result=self.r.recover(self.home,self.app,apply=True,pressure_only=True,observer=lambda:([],[]))
+            fcntl.flock(lease,fcntl.LOCK_EX);result=self.r.recover(self.home,self.app,apply=True,pressure_only=True,observer=lambda:([],[]),floors={str(self.home):1000000020})
         self.assertTrue(all(not x.exists() for x in paths),result);self.assertLessEqual(len(calls),8,'pressure registry scans must be bounded per batch')
     def test_next_batch_uses_remaining_physical_deficit(self):
         import fcntl,json
@@ -87,7 +87,7 @@ class BulkRecoveryTests(unittest.TestCase):
             removed=sum(not x.exists() for x in paths)
             return SimpleNamespace(free=20+(3*unit if removed>=4 else removed*2*unit//3))
         with p.open('a+') as lease,patch.object(self.r.shutil,'disk_usage',side_effect=physical),patch.object(self.r.os.path,'ismount',return_value=True):
-            fcntl.flock(lease,fcntl.LOCK_EX);self.r.recover(self.home,self.app,apply=True,pressure_only=True,observer=lambda:([],[]))
+            fcntl.flock(lease,fcntl.LOCK_EX);self.r.recover(self.home,self.app,apply=True,pressure_only=True,observer=lambda:([],[]),floors={str(self.home):20+3*unit})
         self.assertEqual(sum(not x.exists() for x in paths),4,'remeasured capacity must shrink the next batch rather than churn two extra caches')
     def test_independent_gradle_task_cache_entries_preserve_protected_neighbors(self):
         base='.gradle/caches/build-cache-1/'

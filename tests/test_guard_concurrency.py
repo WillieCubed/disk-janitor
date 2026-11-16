@@ -46,7 +46,7 @@ class ConcurrentGuardTests(unittest.TestCase):
                 +('exec("while not Path('+repr(str(self.release))+').exists() and time.monotonic()<end: time.sleep(.01)")' if hold else ''))
     def spawn(self,name,hold=False,job=None,once=False,pressure='1'):
         artifact=self.root/('out-'+name);artifact.mkdir(exist_ok=True)
-        args=['guard','--root-reserve-gib','.05','--planned-gib','.04','--max-growth-gib','.04',
+        args=['guard','--root-reserve-gib','.05','--planned-gib','.04','--max-growth-gib','.04','--max-running','1',
               '--owner',name,'--artifact-root',str(artifact),'--deadline-seconds','5']
         if job:args+=['--job-id',job]
         if once:args+=['--once']
@@ -60,10 +60,10 @@ class ConcurrentGuardTests(unittest.TestCase):
         self.assertTrue(predicate())
     def finish(self,p,code=0):
         out=p.communicate(timeout=7)[0];self.assertEqual(p.returncode,code,out);return out
-    def test_atomic_pending_growth_and_automatic_completion(self):
+    def test_one_slot_runs_one_job_and_the_waiter_starts_when_it_frees(self):
         a=self.spawn('a',True);b=self.spawn('b',True)
         self.until(lambda:(self.root/'a').exists() or (self.root/'b').exists());time.sleep(.15)
-        self.assertEqual(sum((self.root/name).exists() for name in ['a','b']),1,'two commitments must not claim the same remaining bytes')
+        self.assertEqual(sum((self.root/name).exists() for name in ['a','b']),1,'one slot runs one job')
         self.assertIsNone(a.poll());self.assertIsNone(b.poll())
         self.release.touch();self.finish(a);self.finish(b)
         self.assertTrue((self.root/'a').exists());self.assertTrue((self.root/'b').exists())
@@ -92,31 +92,17 @@ class ConcurrentGuardTests(unittest.TestCase):
         record=json.loads(p.read_text());record['pid']=99999999;p.write_text(json.dumps(record))
         b=self.spawn('other',once=True);self.finish(b,75);self.assertFalse((self.root/'other').exists())
         self.release.touch();self.finish(a)
-    def test_low_disk_recovers_without_restarting_command(self):
-        capacity=self.root/'capacity';capacity.write_text('.02');self.env['FIXTURE_FREE_FILE']=str(capacity)
-        p=self.spawn('recover-disk',job='recover-disk');time.sleep(.15)
-        self.assertIsNone(p.poll());self.assertFalse((self.root/'recover-disk').exists())
-        replacement=capacity.with_suffix('.next');replacement.write_text('.1');replacement.replace(capacity);self.finish(p)
-        self.assertEqual((self.root/'recover-disk').read_text(),'run\n')
+    def test_low_disk_fails_at_once_and_never_waits(self):
+        self.env['FIXTURE_FREE_GIB']='.02'
+        started=time.monotonic();out=self.finish(self.spawn('low-disk',job='low-disk'),75)
+        self.assertLess(time.monotonic()-started,6)
+        self.assertIn('insufficient disk: 0.02 GiB free on',out);self.assertIn('need 0.05 GiB; reclaim freed 0.00 GiB',out)
+        self.assertFalse((self.root/'low-disk').exists())
+        result=json.loads((self.root/'.dj/guard-reservations/low-disk.result').read_text())
+        self.assertEqual((result['exit_code'],result['status'],result['no_launch']),(75,'refused',True))
+        self.assertEqual(json.loads((self.root/'.dj/guard-reservations/low-disk.json').read_text())['state'],'refused')
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS sysctl admission-pressure source')
-    def test_critical_memory_recovers_without_agent_continue(self):
-        pressure=self.root/'pressure';pressure.write_text('4');self.env['FIXTURE_PRESSURE_FILE']=str(pressure)
-        p=self.spawn('recover-memory',job='recover-memory');time.sleep(.15)
-        self.assertIsNone(p.poll());self.assertFalse((self.root/'recover-memory').exists())
-        replacement=pressure.with_suffix('.next');replacement.write_text('1');replacement.replace(pressure);self.finish(p)
-        self.assertEqual((self.root/'recover-memory').read_text(),'run\n')
-    def test_nested_artifacts_cannot_double_credit_growth(self):
-        self.env['FIXTURE_FREE_GIB']='1'
-        a=self.spawn('holder',True);self.until(lambda:(self.root/'holder').exists())
-        artifact=self.root/'out-holder'/'nested';artifact.mkdir()
-        args=['guard','--root-reserve-gib','.05','--planned-gib','.04',
-              '--owner','nested','--artifact-root',str(artifact),'--once','--',sys.executable,'-c',self.code('nested')]
-        p=subprocess.Popen([sys.executable,'-c',BOOTSTRAP,str(REPO/'bin/disk-janitor'),*args],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-        self.processes.append(p);out=self.finish(p,75)
-        self.assertIn('overlaps active owner',out);self.assertFalse((self.root/'nested').exists())
-        self.release.touch();self.finish(a)
-    @unittest.skipUnless(sys.platform == 'darwin', 'macOS sysctl admission-pressure source')
-    def test_real_memory_pressure_defers_without_launch(self):
+    def test_critical_memory_pressure_fails_without_launch(self):
         p=self.spawn('memory',once=True,pressure='4');out=self.finish(p,75)
         self.assertIn('critical memory pressure',out);self.assertFalse((self.root/'memory').exists())
 

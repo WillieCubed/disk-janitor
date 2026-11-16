@@ -100,12 +100,22 @@ class BridgeTests(unittest.TestCase):
         env = dict(os.environ, HOME=str(self.root), DISK_JANITOR_HOME=str(self.home),
                    DISK_JANITOR_RUNTIME_DIR=str(REPO / 'bin'))
         result = subprocess.run([sys.executable, '-c', GUARD_BOOTSTRAP, str(REPO / 'bin/disk-janitor'),
-            str(self.config), 'guard', '--root-reserve-gib', '20', '--planned-gib', '10', '--owner', 'local',
+            str(self.config), 'guard', '--root-reserve-gib', '0', '--planned-gib', '10', '--owner', 'local', '--max-running', '2',
             '--once', '--', sys.executable, '-c', 'from pathlib import Path;Path('+repr(str(marker))+').touch()'],
             env=env, text=True, capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertTrue(marker.exists(), 'one CI runner leaves the second slot to local work')
+        marker.unlink()
+        (self.home / 'slots').mkdir(exist_ok=True)
+        with (self.home / 'slots/slot-0.lock').open('a') as running:
+            fcntl.flock(running, fcntl.LOCK_EX)
+            result = subprocess.run([sys.executable, '-c', GUARD_BOOTSTRAP, str(REPO / 'bin/disk-janitor'),
+                str(self.config), 'guard', '--root-reserve-gib', '0', '--owner', 'local', '--max-running', '2',
+                '--once', '--', sys.executable, '-c', 'from pathlib import Path;Path('+repr(str(marker))+').touch()'],
+                env=env, text=True, capture_output=True, timeout=8)
         self.assertEqual(result.returncode, 75, result.stdout+result.stderr)
         self.assertFalse(marker.exists())
-        self.assertIn('RunnerPools studio/linux', result.stdout+result.stderr)
+        self.assertIn('1 held by RunnerPools CI runners', result.stdout+result.stderr)
 
     def test_local_first_defers_real_broker_before_vm_preparation(self):
         self.local()
@@ -236,8 +246,12 @@ with open(lock) as stream:
     def test_actual_guard_cancel_then_ci_admission_without_other_local_job(self):
         env = dict(os.environ, HOME=str(self.root), DISK_JANITOR_HOME=str(self.home),
                    DISK_JANITOR_RUNTIME_DIR=str(REPO / 'bin'))
+        (self.home / 'slots').mkdir(exist_ok=True)
+        running = (self.home / 'slots/slot-0.lock').open('a')
+        self.addCleanup(running.close)
+        fcntl.flock(running, fcntl.LOCK_EX)
         process = subprocess.Popen([sys.executable, '-c', GUARD_BOOTSTRAP, str(REPO / 'bin/disk-janitor'),
-            str(self.config), 'guard', '--root-reserve-gib', '20', '--planned-gib', '60', '--owner', 'cancelled',
+            str(self.config), 'guard', '--root-reserve-gib', '20', '--planned-gib', '60', '--owner', 'cancelled', '--max-running', '1',
             '--job-id', 'cancelled', '--deadline-seconds', '4', '--', sys.executable, '-c', 'raise SystemExit(99)'],
             env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:

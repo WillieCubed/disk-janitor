@@ -85,8 +85,10 @@ class RecoveryActivityTests(unittest.TestCase):
 
     def test_live_process_identity_inspection_failure_is_not_silently_ignored(self):
         with patch.object(self.recovery, '_process_executable', side_effect=PermissionError('denied')):
-            with self.assertRaises(RuntimeError):
-                self.recovery.activity()
+            commands, _ = self.recovery.activity()
+        self.assertTrue(any(command['pid'] == os.getpid() and command['family'] == 'unknown' for command in commands))
+        for kind in ('cargo-incremental', 'gradle-build-cache', 'xcode-derived'):
+            self.assertTrue(self.recovery.busy(kind, self.path, commands, []))
 
     def test_established_exit_during_process_inspection_is_safe(self):
         original = self.recovery.subprocess.run
@@ -125,8 +127,9 @@ class RecoveryActivityTests(unittest.TestCase):
         with patch.object(self.recovery.subprocess, 'run', side_effect=run), \
              patch.object(self.recovery, '_process_executable', side_effect=FileNotFoundError(2, 'unknown')), \
              patch.object(self.recovery, '_process_exited', return_value=False):
-            with self.assertRaises(RuntimeError):
-                self.recovery.activity()
+            commands, _ = self.recovery.activity()
+        self.assertEqual(commands, [dict(pid=999999, executable=None, family='unknown')])
+        self.assertTrue(self.recovery.busy('cargo-incremental', self.path, commands, []))
 
     def test_live_structured_argv_keeps_spaces_and_empty_application_arguments(self):
         tail = ['classpath with spaces', '', 'org.gradle.launcher.GradleMain']

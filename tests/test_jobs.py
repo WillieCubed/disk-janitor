@@ -105,12 +105,16 @@ class JobTests(unittest.TestCase):
 
     def test_worker_loss_before_admission_preserves_queued_executor(self):
         import fcntl
-        self.app.mkdir(parents=True, exist_ok=True)
-        with (self.app / 'admission.lock').open('a') as gate:
+        (self.app / 'slots').mkdir(parents=True, exist_ok=True)
+        self.env['DISK_JANITOR_MAX_RUNNING'] = '1'
+        with (self.app / 'slots/slot-0.lock').open('a') as gate:
             fcntl.flock(gate, fcntl.LOCK_EX)
-            job = self.submit('from pathlib import Path;Path("queued-once").open("a").write("once")')
+            job = self.submit('from pathlib import Path;Path("queued-once").open("a").write("once")  # build')
+            self.until(lambda: self.status(job).get('reason'))
             os.kill(self.status(job)['worker_pid'], signal.SIGKILL)
-            self.assertEqual(self.status(job)['state'], 'queued')
+            view = self.status(job)
+            self.assertEqual(view['state'], 'queued')
+            self.assertIn('waiting for a free slot: position 1 of 1; 1 of 1 slots', view['reason'])
         self.assertEqual(self.invoke('wait', job).returncode, 0)
         self.assertEqual((self.home / 'queued-once').read_text(), 'once')
 
@@ -142,6 +146,7 @@ class JobTests(unittest.TestCase):
         intervals = [json.loads((self.home / ('timing-' + str(i))).read_text()) for i in range(2)]
         self.assertLess(max(x[0] for x in intervals), min(x[1] for x in intervals), intervals)
         evidence = {'jobs': 2, 'elapsed_seconds': time.monotonic() - start, 'intervals': intervals}
+        (REPO / 'evidence').mkdir(exist_ok=True)
         (REPO / 'evidence/throughput.json').write_text(json.dumps(evidence, indent=2) + '\n')
 
     @unittest.skipUnless(sys.platform == 'darwin', 'Seatbelt inheritance is a macOS integration check')

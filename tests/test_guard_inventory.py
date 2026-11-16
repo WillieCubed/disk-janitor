@@ -56,17 +56,14 @@ class InventoryGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(marker.read_text(), 'once')
 
-    def test_temporary_inventory_timeout_retries_before_launch(self):
-        result, marker = self.invoke('recover')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('Queued', result.stderr)
-        self.assertEqual(marker.read_text(), 'once')
-
-    def test_persistent_inventory_timeout_defers_without_launch(self):
-        result, marker = self.invoke('timeout')
-        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+    def test_inventory_timeouts_never_delay_or_refuse_a_launch(self):
+        for mode in ('recover', 'timeout'):
+            result, marker = self.invoke(mode)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn('Waiting', result.stderr)
+            self.assertEqual(marker.read_text(), 'once')
         self.assertIn('measurement timed out', result.stderr)
-        self.assertFalse(marker.exists())
+        self.assertIn('Storage advisory', result.stderr)
 
     def test_slow_scan_reports_excess_retention_as_advisory(self):
         result, marker = self.invoke('slow', limit='.000001', size='100')

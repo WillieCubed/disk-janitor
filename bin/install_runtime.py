@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Publish one complete immutable runtime and activate it with one symlink flip."""
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit('disk-janitor: Python 3.10 or newer is required; this is ' + sys.version.split()[0])
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -9,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import sys
 import uuid
 
 COMPONENTS = ('disk-janitor', 'recovery.py', 'jobs.py', 'capacity.py', 'coverage.py',

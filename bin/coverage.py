@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Scoped build entrypoints. Admission and execution remain in the existing guard."""
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit('disk-janitor: Python 3.10 or newer is required; this is ' + sys.version.split()[0])
 import argparse
 import fcntl
 import json
@@ -10,7 +13,6 @@ import shlex
 import shutil
 import stat
 import subprocess
-import sys
 
 import jobs
 

@@ -65,14 +65,17 @@ class GuardTests(unittest.TestCase):
         self.assertIn('advisory', result.stdout)
         self.assertTrue(self.marker.exists())
 
-    def test_active_guard_is_excluded(self):
+    def test_exclusively_held_cache_fence_does_not_hold_a_job(self):
         (self.home / '.dj').mkdir()
+        started = time.monotonic()
         with open(self.home / '.dj/guard.lock', 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = self.guarded()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('active', result.stdout)
-        self.assertFalse(self.marker.exists())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn('started without it', result.stdout)
+        self.assertTrue(self.marker.exists())
+        self.assertIn('cache fence', (self.home / '.dj/admission-notices.log').read_text())
 
     def test_finite_job_coexists_with_persistent_guard(self):
         first_root = self.home / 'persistent'
@@ -134,13 +137,13 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
-    def test_capacity_wait_is_bounded_and_returns_deferred_status(self):
+    def test_floor_shortfall_fails_at_once_with_deferred_status(self):
         (self.artifacts / 'retained').write_bytes(b'x' * 65536)
         started = time.monotonic()
         result = self.run_cli('guard','--root-reserve-gib','1000000','--planned-gib','0','--max-growth-gib','.001','--owner','fixture','--artifact-root',str(self.artifacts),'--max-retained-gib','0.000001','--deadline-seconds','.2','--',sys.executable,'-c','pass')
         self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertGreaterEqual(time.monotonic() - started, .2)
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertRegex(result.stdout, r'insufficient disk: [0-9.]+ GiB free on .*, need 1000000.00 GiB; reclaim freed')
         self.assertFalse(self.marker.exists())
 
     def test_retention_is_rechecked_after_waiting_for_lease(self):

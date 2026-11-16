@@ -30,22 +30,22 @@ class PausedDemandTests(unittest.TestCase):
     def demand(self):
         with self.path.open('rb') as executor:
             fcntl.flock(executor,fcntl.LOCK_EX)
-            with patch.object(self.module.shutil,'disk_usage',return_value=SimpleNamespace(free=15)),patch.object(self.module.os.path,'ismount',return_value=True):
-                return self.module.pressure_demand(self.app)
+            with patch.object(self.module.shutil,'disk_usage',return_value=SimpleNamespace(free=15)),patch.object(self.module.os.path,'ismount',return_value=True),patch.dict(os.environ,{'DISK_JANITOR_LOW_WATER_GIB':'0'}):
+                return self.module.pressure_demand(self.app,home=self.root)
 
     def test_solo_pressure_blocked_writer_requests_reserve_plus_hysteresis(self):
         demand=self.demand()
         self.assertIn(self.root.stat().st_dev,demand)
         self.assertEqual(demand[self.root.stat().st_dev]['deficit'],15)
-        self.assertEqual(demand[self.root.stat().st_dev]['required'],0,'already admitted work does not reserve its full command again')
+        self.assertEqual(demand[self.root.stat().st_dev]['required'],30,'its reserve plus hysteresis, never its whole command again')
 
-    def test_runtime_identity_mismatch_preserves_caches(self):
+    def test_runtime_identity_mismatch_is_skipped_without_a_veto(self):
         item=json.loads(self.runtime.read_text());item['command_hash']='b'*64;self.runtime.write_text(json.dumps(item))
-        with self.assertRaisesRegex(RuntimeError,'pressure|runtime'):self.demand()
+        self.assertEqual(self.demand(),{})
 
-    def test_negative_hysteresis_preserves_caches(self):
+    def test_negative_hysteresis_is_skipped_without_a_veto(self):
         item=json.loads(self.runtime.read_text());item['hysteresis_bytes']=-1;self.runtime.write_text(json.dumps(item))
-        with self.assertRaisesRegex(RuntimeError,'pressure|runtime'):self.demand()
+        self.assertEqual(self.demand(),{})
 
     def test_running_without_paused_observation_does_not_request_recovery(self):
         self.runtime.unlink()

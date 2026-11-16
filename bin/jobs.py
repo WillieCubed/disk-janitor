@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Durable local job submission. Policy belongs to the guard, not its clients."""
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit('disk-janitor: Python 3.10 or newer is required; this is ' + sys.version.split()[0])
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -12,13 +15,21 @@ import select
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from capacity import LearningStore
+from capacity import LearningStore, queue_view
 
 TERMINAL = frozenset({'succeeded', 'failed', 'cancelled', 'unknown'})
+# Commands that plainly run no build tool need no disk headroom to start.
+LIGHT = frozenset({'git', 'gh', 'echo', 'printf', 'true', 'false', 'ls', 'cat', 'pwd', 'date', 'sleep', 'which',
+                   'grep', 'rg', 'sed', 'awk', 'head', 'tail', 'wc', 'diff', 'curl', 'ssh', 'sh', 'bash', 'zsh',
+                   'python', 'python3'})
+HEAVY = re.compile(r'(?<![A-Za-z0-9])(gradle\w*|cargo|rustc|xcodebuild|swift\w*|npm|npx|pnpm|yarn|bun|make|cmake|'
+                   r'ninja|bazel|mvn|docker|flutter|dotnet|java\w*|kotlin\w*|clang|gcc|tsc|vite|turbo|pytest|'
+                   r'unittest|tox|pip\d?|uv|build|compile|assemble|test|install|run|emulator|adb)(?![A-Za-z0-9])', re.I)
+EXECUTOR_ATTEMPTS = 3
+SILENT_SECONDS = 2 * 3600
 STATES = frozenset({'queued', 'running', 'cancelling'}) | TERMINAL
 GIB = 2 ** 30
 
@@ -42,6 +53,28 @@ def policy(command):
     if executable in ('cargo', 'gradle', 'gradlew', 'xcodebuild', 'swift', 'swiftc', 'rustc'):
         return {'kind': 'native', 'disk_gib': 4, 'memory_gib': 8}
     return {'kind': 'general', 'disk_gib': 2, 'memory_gib': 2}
+
+
+def light(command):
+    """Whether a command is known to run no build tool. Anything uncertain is not light."""
+    words = list(command)
+    while words and (Path(words[0]).name == 'env' or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', words[0])):
+        words = words[1:]
+    return (bool(words) and Path(words[0]).name.lower() in LIGHT
+            and not any(HEAVY.search(word) for word in command))
+
+
+def lock_within(stream, seconds):
+    """Take an exclusive lock within a bound; a stuck holder fails this caller instead of hanging it."""
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                raise RuntimeError('job state is locked by another process')
+            time.sleep(.01)
 
 
 def mount_root(path):
@@ -122,7 +155,7 @@ class Store:
             raise ValueError('unsafe job lock')
         descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'a') as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
+            lock_within(stream, 10)
             yield directory
 
     def update(self, job, **changes):
@@ -152,6 +185,7 @@ class Store:
         learning = LearningStore(self.home / 'capacity-history')
         observation_key = learning.key(command, cwd)
         profile = learning.predict(observation_key, policy(command))
+        profile['light'] = light(command)
         value = {'version': 1, 'id': job, 'backend_job_id': job, 'owner': 'job:' + owner,
                  'client': owner, 'agent_client': agent, 'submitted_at': time.time(),
                  'argv': list(command), 'label': Path(command[0]).name,
@@ -224,6 +258,20 @@ class Store:
                 else:
                     state, code = 'unknown', 125
         value = dict(value, state=state, exit_code=code)
+        if result is not None and result.get('reason') and state in TERMINAL:
+            value['reason'] = result['reason']
+        try:
+            if state == 'queued':
+                queue = queue_view(self.home, job)
+                if queue['position']:
+                    value['reason'] = ('waiting for a free slot: position %d of %d; %d of %d slots are running jobs'
+                                       % (queue['position'], len(queue['waiting']), queue['busy'], queue['limit']))
+            elif state == 'running':
+                quiet = time.time() - max((self.directory(job) / 'output.log').stat().st_mtime, value['submitted_at'])
+                if quiet > SILENT_SECONDS:
+                    value['reason'] = 'running with no output for %d minutes' % (quiet // 60)
+        except (OSError, ValueError):
+            pass
         runtime = self.backend(value, '.runtime')
         if state not in TERMINAL and runtime is not None and runtime.get('state') in {'pressure-blocked','pressure-observed'}:
             available=lease_held(self.home/'guard-reservations'/(job+'.controller'))
@@ -287,10 +335,11 @@ def guard_command(store, meta):
                '--submitted-at', str(meta['submitted_at']),
                '--job-control-file', str(store.directory(meta['id']) / 'job.json'),
                '--job-log-file', str(store.directory(meta['id']) / 'output.log')]
+    if profile.get('light'):
+        return command + ['--light', '--', *meta['argv']]
+    # Only filesystems this job names are required: its working directory and any
+    # external path among its arguments. Each has a small floor, not a shared reserve.
     mounts = {}
-    external = Path('/Volumes/WillieDrive')
-    if external.is_mount():
-        mounts[str(external)] = (100, profile.get('disk_by_device', {}).get(str(external.stat().st_dev), profile['disk_gib']))
     cwd_mount = mount_root(meta['cwd'])
     internal_devices = {Path('/').stat().st_dev, Path.home().stat().st_dev}
     if cwd_mount.stat().st_dev not in internal_devices and str(cwd_mount) not in mounts:
@@ -299,8 +348,7 @@ def guard_command(store, meta):
     for arg in meta['argv']:
         match = re.match(r'^(/Volumes/[^/]+)(?:/|$)', arg)
         if match and match[1] not in mounts:
-            mount = Path(match[1])
-            mounts[match[1]] = (100 if mount == external else 1, profile['disk_gib'])
+            mounts[match[1]] = (1, profile['disk_gib'])
     for path, (reserve, budget) in mounts.items():
         command += ['--volume', path, str(reserve), '--write-budget', path, str(budget)]
     return command + ['--', *meta['argv']]
@@ -321,17 +369,18 @@ def worker(store, job):
         diagnostic = directory / 'guardian.log'
         output_fd = os.open(diagnostic, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         lifetime_fd = os.open(directory / 'guardian.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+        lock_within(lifetime_fd, 10)
         try:
             with os.fdopen(output_fd, 'ab', buffering=0) as output:
                 ready_sent = False
                 retry_delay = .1
+                attempts = 0
                 while True:
                     # The same still-live worker is the permission-context custodian.
                     # Reacquire the executor lease for each prelaunch replacement.
                     if lifetime_fd < 0:
                         lifetime_fd = os.open(directory / 'guardian.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-                        fcntl.flock(lifetime_fd, fcntl.LOCK_EX)
+                        lock_within(lifetime_fd, 10)
                     guardian = subprocess.Popen(guard_command(store, meta), cwd=meta['cwd'],
                                                 stdout=output, stderr=subprocess.STDOUT,
                                                 stdin=subprocess.DEVNULL, pass_fds=(lifetime_fd,))
@@ -346,8 +395,9 @@ def worker(store, job):
                         if time.monotonic() > deadline:
                             store.update(job, cancel_requested=True); break
                         time.sleep(.02)
-                    while guardian.poll() is None: time.sleep(.1)
+                    while guardian.poll() is None: time.sleep(.02)
                     code = guardian.returncode
+                    attempts += 1
                     # Reap first, then fence the exact launch decision. Neither an
                     # observer nor a new worker may reconstruct a lost context.
                     with store.locked(job):
@@ -358,12 +408,14 @@ def worker(store, job):
                                        and not lease_held(store.home / 'guard-reservations' / (job+'.json'))
                                        and store.outcome(current) is None
                                        and (backend is None or backend.get('child') is None))
-                    if not recoverable: break
+                    # A guardian that keeps failing before launch is a failure to report,
+                    # not a job to keep queued.
+                    if not recoverable or attempts >= EXECUTOR_ATTEMPTS: break
                     # Backoff protects against a broken executable without limiting
                     # recovery of accepted work. Cancellation remains cooperative.
                     store.update(job, state='queued', exit_code=None, reason='recovering executor before command launch')
                     time.sleep(retry_delay)
-                    retry_delay = min(3, retry_delay*1.6)
+                    retry_delay = min(1, retry_delay*1.6)
 
         finally:
             if lifetime_fd >= 0:
@@ -381,7 +433,8 @@ def worker(store, job):
             state = ('unknown' if result.get('status') == 'outcome-uncertain' else
                      'succeeded' if result['exit_code'] == 0 else
                      'cancelled' if result['exit_code'] == 143 else 'failed')
-            store.update(job, state=state, exit_code=result['exit_code'])
+            store.update(job, state=state, exit_code=result['exit_code'],
+                         **({'reason': result['reason']} if result.get('reason') else {}))
 
         return code
 
@@ -456,6 +509,8 @@ def main():
                 print(json.dumps(values))
             elif args.job:
                 print(f"{values['id']} {values['state']} exit={values['exit_code']}")
+                if values.get('reason') and not (values.get('pressure_observed') or values.get('executor_unavailable')):
+                    print('reason: ' + str(values['reason']))
                 if values.get('pressure_observed') or values.get('executor_unavailable'):
                     phase='executor-unavailable' if values.get('executor_unavailable') else 'pressure-blocked' if values.get('pressure_blocked') else 'pressure-observed'
                     print(phase+': '+str(values.get('reason') or 'capacity observation'))
@@ -464,7 +519,8 @@ def main():
                 print(f"{shutil.disk_usage('/').free/GIB:.1f} GiB internal free")
                 for j in values:
                     phase='executor-unavailable' if j.get('executor_unavailable') else 'pressure-blocked' if j.get('pressure_blocked') else 'pressure-observed' if j.get('pressure_observed') else j['state']
-                    print(f"{j['id']} {phase:10} {j['label']}")
+                    note = f"  ({j['reason']})" if j.get('reason') and phase in ('queued', 'running') else ''
+                    print(f"{j['id']} {phase:10} {j['label']}{note}")
         elif args.action == 'logs':
             logs(store, args.job, args.follow)
         elif args.action == 'wait':
@@ -472,6 +528,8 @@ def main():
                 meta = store.view(args.job)
                 if meta['state'] in TERMINAL:
                     print(meta['id'] + ' ' + meta['state'])
+                    if meta['state'] != 'succeeded' and meta.get('reason'):
+                        print('disk-janitor: ' + str(meta['reason']), file=sys.stderr)
                     return meta['exit_code'] if meta['exit_code'] is not None else 125
                 time.sleep(.1)
         elif args.action == 'cancel':

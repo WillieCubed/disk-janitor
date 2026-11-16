@@ -4,18 +4,21 @@
 This is cooperative group enforcement, not a filesystem quota. A controller owns
 an unreaped session leader; persisted PIDs never authorize process signals.
 """
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit('disk-janitor: Python 3.10 or newer is required; this is ' + sys.version.split()[0])
 import fcntl
 import hashlib
 import json
 import math
 import os
+import re
 import select
 from pathlib import Path
 import shutil
 import signal
 import stat
 import subprocess
-import sys
 import time
 import uuid
 
@@ -36,6 +39,253 @@ def atomic_json(path, value):
         finally: os.close(descriptor)
     finally:
         if temporary.exists(): temporary.unlink()
+
+
+def slot_limit():
+    """How many build jobs run at once before the machine is oversubscribed.
+
+    A build uses several cores and several GiB, so there is one slot per four cores and
+    per 16 GiB of memory, whichever is fewer. DISK_JANITOR_MAX_RUNNING overrides it.
+    """
+    configured = os.environ.get('DISK_JANITOR_MAX_RUNNING', '')
+    if configured.isdigit() and int(configured) > 0:
+        return int(configured)
+    try:
+        memory = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+    except (ValueError, OSError):
+        memory = 16 * GIB
+    return max(1, min((os.cpu_count() or 4) // 4, memory // (16 * GIB)))
+
+
+def _private_directory(app_home, name):
+    directory = Path(app_home) / name
+    if directory.is_symlink(): raise ValueError('unsafe ' + name + ' directory')
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory
+
+
+def take_slot(app_home, limit):
+    """Hold a slot for as long as the returned descriptor stays open, or return None.
+
+    The kernel lock is the slot: a holder that dies frees it, and no record can occupy one.
+    """
+    directory = _private_directory(app_home, 'slots')
+    for index in range(limit):
+        descriptor = os.open(directory / ('slot-%d.lock' % index), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            os.close(descriptor)
+    return None
+
+
+def slots_busy(app_home, limit):
+    busy = 0
+    for index in range(limit):
+        try:
+            descriptor = os.open(Path(app_home) / 'slots' / ('slot-%d.lock' % index), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            busy += 1
+        finally:
+            os.close(descriptor)
+    return busy
+
+
+def _ticket_name(name):
+    return len(name) > 21 and name[:20].isdigit() and name[20] == '-' and not name.endswith('.go')
+
+
+def join_queue(app_home, created, job_id):
+    """Queue behind earlier submissions. Returns the ticket path and its locked descriptor.
+
+    The ticket is published already locked, and its lock is what makes it count: a waiter
+    that dies leaves the queue with no cleanup, and a stale file is never a place in line.
+    """
+    directory = _private_directory(app_home, 'queue')
+    ticket = directory / ('%020d-%s' % (int(created * 1e6), job_id))
+    staged = directory / ('.joining-' + uuid.uuid4().hex)
+    descriptor = os.open(staged, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.replace(staged, ticket)
+    except BaseException:
+        os.close(descriptor)
+        if staged.exists(): staged.unlink()
+        raise
+    return ticket, descriptor
+
+
+def waiting_tickets(app_home, fresh_seconds=5):
+    """Tickets, oldest first, whose waiter holds its lock and has polled recently.
+
+    A ticket nobody holds is removed. One whose waiter stopped polling is ignored, so a
+    stuck process cannot keep the jobs behind it from a free slot.
+    """
+    directory = Path(app_home) / 'queue'
+    try:
+        names = sorted(name for name in os.listdir(directory) if _ticket_name(name))
+    except OSError:
+        return []
+    live = []
+    for name in names:
+        path = directory / name
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if time.time() - os.fstat(descriptor).st_mtime <= fresh_seconds: live.append(name)
+        else:
+            for stale in (path, path.with_name(name + '.go')):
+                try: stale.unlink()
+                except OSError: pass
+        finally:
+            os.close(descriptor)
+    return live
+
+
+def queue_view(app_home, job_id=None):
+    """Slot use and queue order for status and the watchdog; never an admission input."""
+    limit = slot_limit()
+    waiting = waiting_tickets(app_home)
+    position = next((index + 1 for index, name in enumerate(waiting) if name[21:] == job_id), None)
+    return dict(limit=limit, busy=slots_busy(app_home, limit), waiting=waiting, position=position)
+
+
+def _durable_json(path, payload):
+    temporary = path.with_name(path.name + '.receipt-' + os.urandom(8).hex())
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as output:
+        json.dump(payload, output)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
+def sweep_registry(app_home):
+    """Retire reservation records that no guardian or process group still owns.
+
+    A record is removed only after its outcome is durable: a crashed guardian's command gets
+    an explicit uncertain receipt, so it is never replayed. Nothing here is consulted before
+    a job starts, and no output is touched. Anything unreadable or contradictory is counted
+    and left in place.
+    """
+    registry = Path(app_home) / 'guard-reservations'
+    counts = {'live': 0, 'waiting': 0, 'retired': 0, 'ambiguous': 0}
+    try:
+        names = [entry.name for entry in os.scandir(registry) if entry.name.endswith('.json')]
+    except OSError:
+        return counts
+    for name in names:
+        path = registry / name
+        try:
+            descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, 'r+') as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    raise ValueError('unsafe reservation')
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    counts['live'] += 1
+                    try:
+                        counts['waiting'] += json.load(handle).get('state') == 'waiting'
+                    except (ValueError, AttributeError):
+                        pass
+                    continue
+                if info.st_size == 0:
+                    # A claim that never recorded an admission. Recent ones may still be opening.
+                    if time.time() - info.st_mtime > 60:
+                        path.unlink()
+                        counts['retired'] += 1
+                    continue
+                item = json.load(handle)
+                if not isinstance(item, dict) or item['id'] + '.json' != name:
+                    raise ValueError('reservation identity mismatch')
+                group = item.get('child')
+                if group:
+                    try:
+                        os.killpg(group, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        counts['live'] += 1  # A supervised command outlived its guardian.
+                        continue
+                outcome, captured = registry / (item['id'] + '.result'), registry / (item['id'] + '.outcome')
+                def receipt(source):
+                    with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW)) as stream:
+                        saved = json.load(stream)
+                    if saved.get('owner') != item['owner'] or saved.get('command_hash') != item['command_hash']:
+                        raise ValueError('receipt belongs to another command')
+                    return saved
+                result = receipt(outcome) if os.path.lexists(outcome) else None
+                if os.path.lexists(captured) and (result is None or result.get('status') == 'outcome-uncertain'):
+                    known = receipt(captured)
+                    if type(known.get('exit_code')) is int and 0 <= known['exit_code'] <= 255:
+                        _durable_json(outcome, known)
+                        result = known
+                if result is None and item.get('state') != 'waiting':
+                    # An admitted command whose guardian vanished: its effects are unknown.
+                    _durable_json(outcome, {'owner': item['owner'], 'command_hash': item['command_hash'],
+                                            'exit_code': 125, 'status': 'outcome-uncertain'})
+                path.unlink()
+                counts['retired'] += 1
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, PermissionError):
+            counts['ambiguous'] += 1
+    return counts
+
+
+def request_preemption(app_home, requester_id):
+    """Request cooperative yield; only the owning guardian may stop its child."""
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', requester_id):
+        return None
+    registry = Path(app_home) / 'guard-reservations'
+    requester_path = registry / (requester_id + '.json')
+    if requester_path.is_symlink():
+        return None
+    requester = json.loads(requester_path.read_text())
+    if not isinstance(requester, dict) or requester.get('state') != 'waiting':
+        return None
+    for p in registry.glob('*.json'):
+        if p.is_symlink() or p == requester_path:
+            continue
+        try:
+            target = json.loads(p.read_text())
+            if (not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', str(target.get('id','')))
+                    or target.get('state') != 'running' or target.get('restartable') is not True
+                    or target.get('restart_kind') not in ('build', 'test', 'preview')
+                    or target.get('class') == 'service' or target.get('preemptions', 0) >= 2
+                    or not target.get('child') or target.get('class') == requester.get('class')):
+                continue
+            if requester.get('class') != 'feedback' or target.get('class') != 'build':
+                continue
+            # A held registry lock confirms an owning guardian is still present.
+            with p.open('r+') as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    continue
+                except BlockingIOError:
+                    pass
+            message = {'id': target['id'], 'owner': target['owner'],
+                       'command_hash': target['command_hash'], 'child': target['child'],
+                       'requester': requester_id, 'created': time.time()}
+            destination = registry / (target['id'] + '.preempt-request')
+            if destination.is_symlink():
+                continue
+            temporary = destination.with_name(destination.name + '.' + str(os.getpid()))
+            temporary.write_text(json.dumps(message))
+            os.replace(temporary, destination)
+            return target['id']
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            continue
+    return None
 
 
 class LearningStore:
@@ -89,7 +339,15 @@ class LearningStore:
         fence = self.root / 'history.lock'
         descriptor = os.open(fence, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'a') as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
+            end = time.monotonic() + 1
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    # An observation is optional; a job's completion never waits for one.
+                    if time.monotonic() >= end: raise OSError('observation history is busy')
+                    time.sleep(.01)
             samples = self.read(key)
             samples.append(dict(device=device, bytes=observed_bytes, successful=bool(successful), complete=bool(complete), source='owned-allocation' if complete else 'filesystem-pressure-envelope'))
             atomic_json(self._path(key), dict(version=1, samples=samples[-16:], updated=time.time()))

@@ -23,23 +23,25 @@ class ReviewRegressions(fixtures.JobTests):
         self.assertEqual(self.invoke('cancel', job).returncode, 0)
         self.assertEqual(self.invoke('wait', job, timeout=4).returncode, 143)
 
-    def test_cancel_missing_mount_has_no_launch_receipt(self):
+    def test_missing_mount_fails_with_its_reason_and_no_launch(self):
         missing = '/Volumes/DiskJanitorMissing-' + self.home.name + '/command'
         r = self.invoke('submit', '--', missing)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         job = r.stdout.strip()
         self.ids.append(job)
-        self.assertEqual(self.invoke('cancel', job).returncode, 0)
-        self.assertEqual(self.invoke('wait', job, timeout=4).returncode, 143)
+        waited = self.invoke('wait', job, timeout=6)
+        self.assertEqual(waited.returncode, 75, waited.stdout + waited.stderr)
+        self.assertIn('required mount is absent', waited.stderr)
+        self.assertEqual(self.status(job)['state'], 'failed')
 
-    def test_custom_data_mount_uses_backend_default_budget(self):
+    def test_custom_data_mount_below_the_floor_fails_with_the_numbers(self):
         self.app.mkdir(parents=True, exist_ok=True)
         (self.app / 'config.env').write_text('DATA_PATH="/dev"\n')
-        job = self.submit('pass')
-        time.sleep(.5)
-        self.assertEqual(self.status(job)['state'], 'queued')
-        self.invoke('cancel', job)
-        self.assertEqual(self.invoke('wait', job).returncode, 143)
+        job = self.submit('pass  # build')
+        waited = self.invoke('wait', job, timeout=8)
+        self.assertEqual(waited.returncode, 75, waited.stdout + waited.stderr)
+        self.assertRegex(waited.stderr, r'insufficient disk: 0.00 GiB free on /dev, need 5.00 GiB')
+        self.assertEqual(self.status(job)['state'], 'failed')
 
     def test_terminal_receipt_waits_for_execution_lease_retirement(self):
         spec = importlib.util.spec_from_file_location('review_jobs', self.script)

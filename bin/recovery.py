@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Discover disposable compiler caches; never require per-path approvals."""
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit('disk-janitor: Python 3.10 or newer is required; this is ' + sys.version.split()[0])
 import argparse
 import ctypes
 import errno
 import shlex
-import sys
 from contextlib import ExitStack
 import fcntl
 import json
@@ -16,7 +18,6 @@ import shutil
 import stat
 import subprocess
 import time
-import uuid
 
 
 def _darwin_argv(raw):
@@ -198,9 +199,11 @@ def activity():
                 family = 'gradle' if _java_build_active(argv) else None
             # Never return argv, properties, environment values, or classpaths.
             commands.append(dict(pid=pid, executable=executable, family=family))
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError):
             if not _process_exited(pid):
-                raise RuntimeError('process inspection failed; caches preserved') from error
+                # What this process builds is unknown: it counts as active for every
+                # compiler family, and the remaining inspection continues.
+                commands.append(dict(pid=pid, executable=None, family='unknown'))
     opened = subprocess.run(['lsof', '-nP', '-a', '-u', str(os.getuid()), '-Fpn'],
                             capture_output=True, text=True, timeout=30)
     if opened.returncode not in (0, 1) or opened.stderr.strip():
@@ -212,7 +215,7 @@ def busy(kind, path, commands, opened):
     family = 'cargo' if kind.startswith('cargo-') else 'gradle' if kind.startswith('gradle-') else 'xcode'
     for command in commands:
         if isinstance(command, dict):
-            if command.get('family') == family:
+            if command.get('family') in (family, 'unknown'):
                 return True
             continue
         # Compatibility for deterministic existing observers. These are supplied
@@ -262,7 +265,7 @@ def _cargo_profiles(cargo):
                     yield profile
 
 
-def candidates(home):
+def _cargo_candidates(home):
     cargo = home / '.cache/cargo-target'
     if _plain(cargo, True):
         for profile in _cargo_profiles(cargo):
@@ -277,6 +280,9 @@ def candidates(home):
                 for path in deps.iterdir():
                     if path.suffix in ('.o', '.rlib', '.rmeta') and _plain(path):
                         yield 'cargo-object', path
+
+
+def _gradle_candidates(home):
     caches = home / '.gradle/caches'
     if _plain(caches, True):
         for root in caches.glob('build-cache-*'):
@@ -297,6 +303,9 @@ def candidates(home):
                         and _plain(unit / 'metadata.bin') and _plain(unit / 'results.bin')
                         and _plain(unit / 'transformed', True)):
                     yield 'gradle-transform', unit
+
+
+def _xcode_candidates(home):
     derived = home / 'Library/Developer/Xcode/DerivedData'
     if _plain(derived, True):
         for path in derived.iterdir():
@@ -308,6 +317,101 @@ def candidates(home):
                     target = path / generated
                     if target.exists():
                         yield 'xcode-derived', target
+
+
+GRADLE_SCRIPTS = frozenset({'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts'})
+# Background access below these home folders is blocked or prompts on macOS.
+PRIVACY_GATED = frozenset({'Documents', 'Desktop', 'Downloads', 'Library'})
+
+
+def _git(directory, *arguments):
+    return subprocess.run(['git', '--literal-pathspecs', '-c', 'core.fsmonitor=false', '-C', str(directory), *arguments],
+                          capture_output=True, timeout=10, env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
+
+
+def _project_roots(home):
+    listed = os.environ.get('DISK_JANITOR_PROJECT_DIRS')
+    roots = [Path(name) for name in listed.split(os.pathsep) if name] if listed else [home / 'Projects']
+    return [root for root in roots if root.is_absolute() and root not in (home, Path('/'))]
+
+
+def worktrees(home):
+    """Checkouts of the repositories under the project directories, wherever git placed them."""
+    repositories = []
+    for root in _project_roots(home):
+        if not _plain(root, True):
+            continue
+        for directory, names, _ in os.walk(root, followlinks=False):
+            if '.git' in names:
+                repositories.append(Path(directory))
+                names[:] = []
+            elif len(Path(directory).relative_to(root).parts) >= 2:
+                names[:] = []
+            else:
+                names[:] = sorted(name for name in names if not name.startswith('.') and name != 'node_modules')
+    found = []
+    for repository in repositories:
+        try:
+            listing = _git(repository, 'worktree', 'list', '--porcelain')
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if listing.returncode:
+            continue
+        for line in listing.stdout.split(b'\n'):
+            if not line.startswith(b'worktree '):
+                continue
+            checkout = Path(os.fsdecode(line[9:]))
+            try:
+                gated = checkout.relative_to(home).parts[:1]
+                if (checkout not in found and gated and gated[0] not in PRIVACY_GATED
+                        and checkout.resolve() == checkout and _plain(checkout, True)
+                        and os.path.lexists(checkout / '.git')):
+                    found.append(checkout)
+            except (OSError, ValueError):
+                continue
+    return found
+
+
+def _build_outputs(checkout, deadline=None):
+    """Topmost Gradle `build` directories of one checkout, each beside a Gradle build script."""
+    for directory, names, files in os.walk(checkout, followlinks=False):
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        if directory != str(checkout) and '.git' in names + files:
+            names[:] = []  # A nested checkout answers for itself.
+            continue
+        if 'build' in names and not GRADLE_SCRIPTS.isdisjoint(files):
+            yield Path(directory) / 'build'
+        names[:] = sorted(name for name in names
+                          if name not in ('build', 'src', 'node_modules') and not name.startswith('.'))
+
+
+def _worktree_candidates(home, occupied=None, deadline=None):
+    for checkout in worktrees(home):
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        if occupied is not None and occupied(checkout):
+            continue  # Nothing in an occupied checkout is reclaimable; do not walk it.
+        for output in _build_outputs(checkout, deadline):
+            if _plain(output, True):
+                yield 'worktree-build', output
+
+
+def _checkout_of(path):
+    for parent in path.parents:
+        if os.path.lexists(parent / '.git'):
+            return parent
+    raise ValueError('build output is outside a checkout')
+
+
+def candidates(home, occupied=None, deadline=None):
+    # Outputs of checkouts nobody occupies go first: shared caches still serve active work.
+    for discover in (lambda root: _worktree_candidates(root, occupied, deadline),
+                     _cargo_candidates, _gradle_candidates, _xcode_candidates):
+        try:
+            yield from discover(home)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue  # One unreadable category does not hide the others.
 
 
 def _scope(kind, home):
@@ -326,7 +430,27 @@ class _SourceGuard:
     def clear(self):
         self.scopes.clear()
 
+    def _checkout(self, checkout):
+        # Every directory holding a file git tracks or would add: all else is ignored output.
+        if checkout not in self.scopes:
+            listing = _git(checkout, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')
+            if listing.returncode:
+                raise RuntimeError('cannot establish source state')
+            kept = set()
+            for name in listing.stdout.split(b'\x00'):
+                name = os.fsdecode(name).rpartition('/')[0]
+                while name and name not in kept:
+                    kept.add(name)
+                    name = name.rpartition('/')[0]
+            self.scopes[checkout] = kept
+        return self.scopes[checkout]
+
     def check(self, path, kind):
+        if kind == 'worktree-build':
+            checkout = _checkout_of(path)
+            if str(path.relative_to(checkout)) in self._checkout(checkout):
+                raise ValueError('tracked or uncommitted work preserved')
+            return
         scope = _scope(kind, self.home)
         if scope not in self.scopes:
             probe = subprocess.run(['git', '-C', str(scope), 'rev-parse', '--show-toplevel'],
@@ -362,10 +486,44 @@ def _signature(path, info):
             info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_blocks)
 
 
+KEPT_OUTPUT_SUFFIXES = frozenset({'.sqlite', '.sqlite3', '.sqlite-wal', '.sqlite-shm', '.db', '.db-wal',
+    '.db-shm', '.rdb', '.mdb', '.key', '.pem', '.p12', '.pfx', '.jks', '.keystore'})
+
+
+def _snapshot_output(path):
+    """Signatures of one ignored Gradle output tree.
+
+    Generated sources and links belong here, so the cache rules for source suffixes do not
+    apply; credentials, databases and special files still preserve the whole directory.
+    """
+    rows, allocated, inodes = [], 0, set()
+    def failed(error):
+        raise error
+    paths = [path]
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=failed):
+        paths.extend(Path(root) / name for name in dirs + files)
+    for item in paths:
+        info = item.lstat()
+        if info.st_uid != os.getuid() or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+                                              or stat.S_ISLNK(info.st_mode)):
+            raise ValueError('special file or ownership mismatch')
+        if (item.suffix.lower() in KEPT_OUTPUT_SUFFIXES
+                or item.name in {'.git', '.env', 'credentials', 'credential', 'secrets'}):
+            raise ValueError('credentials or database preserved')
+        rows.append(_signature(item, info))
+        inode = info.st_dev, info.st_ino
+        if inode not in inodes:
+            allocated += info.st_blocks * 512
+            inodes.add(inode)
+    return rows, allocated
+
+
 def snapshot(path, home, *, kind='xcode-derived', source_guard=None):
     if not path.is_relative_to(home) or path == home or path.resolve() != path:
         raise ValueError('noncanonical cache path')
     (source_guard or _SourceGuard(home)).check(path, kind)
+    if kind == 'worktree-build':
+        return _snapshot_output(path)
     rows, allocated, inodes = [], 0, set()
     paths = [path]
     if path.is_dir():
@@ -422,6 +580,9 @@ def _unchanged(path, rows):
 class _OpenPaths:
     def __init__(self, paths, home):
         self.parents = set()
+        self.every = paths
+        self.inside = None
+        self.unknown = None
         prefixes = [str(_scope(kind, home)) for kind in ('cargo-incremental', 'gradle-build-cache', 'xcode-derived')]
         for path in paths:
             if not isinstance(path, str):
@@ -435,15 +596,82 @@ class _OpenPaths:
     def intersects(self, path):
         return str(path) in self.parents
 
+    def occupied(self, root):
+        """Whether an open file, a working directory or a live job sits inside root."""
+        if self.inside is None:
+            self.inside = set()
+            for path in self.every:
+                while path and path not in self.inside:
+                    self.inside.add(path)
+                    path = path.rpartition('/')[0]
+        return str(root) in self.inside
 
-def _activity_view(observer, home):
+
+def _lease_held(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    with os.fdopen(descriptor) as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def job_directories(app_home):
+    """Working directories of submitted jobs that still have an executor or were just created."""
+    app_home = Path(app_home)
+    try:
+        entries = list(os.scandir(app_home / 'jobs'))
+    except FileNotFoundError:
+        return []
+    found = []
+    for entry in entries:
+        if not re.fullmatch(r'j-[0-9a-f]{32}', entry.name):
+            continue
+        directory = Path(entry.path)
+        live = (_lease_held(directory / 'worker.lock') or _lease_held(directory / 'guardian.lock')
+                or _lease_held(app_home / 'guard-reservations' / (entry.name + '.json')))
+        try:
+            descriptor = os.open(directory / 'job.json', os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor) as stream:
+                value = json.load(stream)
+            cwd, submitted = value['cwd'], value.get('submitted_at', 0)
+            if not isinstance(cwd, str) or not isinstance(submitted, (int, float)):
+                raise ValueError('invalid job record')
+        except (OSError, ValueError, KeyError, TypeError):
+            if live:
+                raise RuntimeError('a live job has no readable working directory; build outputs preserved')
+            continue
+        if live or (value.get('state') in ('queued', 'running') and 0 <= time.time() - submitted < 60):
+            found.append(cwd)
+    return found
+
+
+def _activity_view(observer, home, app_home=None):
     commands, opened = observer()
+    unknown = None
+    if app_home is not None:
+        try:
+            opened = list(opened) + job_directories(app_home)
+        except RuntimeError as error:
+            unknown = str(error)
     families = {prefix: busy(kind, Path('/__janitor_activity_probe__'), commands, [])
                 for prefix, kind in [('cargo', 'cargo-incremental'), ('gradle', 'gradle-build-cache'), ('xcode', 'xcode-derived')]}
-    return families, _OpenPaths(opened, home)
+    paths = _OpenPaths(opened, home)
+    paths.unknown = unknown
+    return families, paths
 
 
 def _unit_busy(kind, path, view):
+    if kind == 'worktree-build':
+        # Occupancy of the whole checkout decides, not a compiler family: any open file,
+        # working directory or live job inside it keeps every output it has.
+        if view[1].unknown:
+            raise RuntimeError(view[1].unknown)
+        return view[1].occupied(_checkout_of(path))
     family = kind.partition('-')[0]
     if kind == 'gradle-build-cache':
         lock = path.parent / (path.parent.name + '.lock')
@@ -465,10 +693,10 @@ def _native_remove(paths):
         subprocess.run(['/bin/rm', '-rf', '--', *pending], check=True, capture_output=True)
 
 
-def _recover_batches(home, app_home, *, apply, pressure_only, observer, report):
+def _recover_batches(home, app_home, *, apply, pressure_only, observer, report, floors=None, deadline=None):
     guard = _SourceGuard(home)
-    view = _activity_view(observer, home)
-    demand = pressure_demand(app_home) if pressure_only else None
+    view = _activity_view(observer, home, app_home)
+    demand = pressure_demand(app_home, floors) if pressure_only else None
     pending, allocated, nodes = [], 0, 0
     report['counts'] = {}
     report['batches'] = 0
@@ -499,9 +727,9 @@ def _recover_batches(home, app_home, *, apply, pressure_only, observer, report):
         nonlocal pending, allocated, nodes, view, demand
         if not pending:
             return True
-        fresh = _activity_view(observer, home) if apply else view
+        fresh = _activity_view(observer, home, app_home) if apply else view
         guard.clear()
-        demand = pressure_demand(app_home) if pressure_only else None
+        demand = pressure_demand(app_home, floors) if pressure_only else None
         selected = []
         for kind, path, rows, entry in pending:
             try:
@@ -536,12 +764,17 @@ def _recover_batches(home, app_home, *, apply, pressure_only, observer, report):
         pending, allocated, nodes = [], 0, 0
         view = fresh
         if pressure_only:
-            demand = pressure_demand(app_home)
+            demand = pressure_demand(app_home, floors)
             report['remaining_demand'] = demand
             return bool(demand)
         return True
 
-    for kind, path in candidates(home):
+    def occupied(checkout):
+        return bool(view[1].unknown) or view[1].occupied(checkout)
+
+    for kind, path in candidates(home, occupied, deadline):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         try:
             if pressure_only:
                 if not demand:
@@ -562,144 +795,127 @@ def _recover_batches(home, app_home, *, apply, pressure_only, observer, report):
                     break
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             note(dict(kind=kind, path=str(path), allocated_bytes=0), 'preserved', error)
+    if deadline is not None and time.monotonic() >= deadline:
+        report['time_limited'] = True
     flush()
 
 
-def settled_without_writer(registry, item):
-    """Whether an admitted record whose guard has exited holds settlement debt only.
+LOW_WATER_GIB = 30
 
-    Admission already treats such a record as debt with no future disk or memory use: its
-    outcome is durably recorded for the same owner and command, and its process group has
-    retired. It has no live consumer of the caches, so it must not veto reclamation.
-    """
-    if not item.get('retention_unsettled'):
-        return False
-    group = item.get('child')
-    if group:
+
+def _lock_within(handle, seconds):
+    """Take an exclusive lock or give up at a deadline; never queue behind a holder unbounded."""
+    end = time.monotonic() + seconds
+    while True:
         try:
-            os.killpg(group, 0)
-        except ProcessLookupError:
-            pass
-        except (PermissionError, TypeError, ValueError, OverflowError):
-            return False
-        else:
-            return False
-    try:
-        descriptor = os.open(registry / (str(item['id']) + '.result'), os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor) as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= end:
                 return False
-            saved = json.load(stream)
-    except (OSError, ValueError, KeyError):
-        return False
-    return (isinstance(saved, dict) and saved.get('owner') == item.get('owner')
-            and saved.get('command_hash') == item.get('command_hash'))
+            time.sleep(.02)
 
 
-def pressure_demand(app_home):
-    """Fresh per-device deficit of the oldest owned waiter, never queued totals.
+def _mount_of(path):
+    # The topmost directory on the same device. macOS firmlinks put a home on the data
+    # volume without making any of its ancestors a mount point.
+    path = Path(path).resolve()
+    device = path.stat().st_dev
+    while path.parent != path and path.parent.stat().st_dev == device:
+        path = path.parent
+    return path
 
-    Registry locks prove live ownership; PIDs do not. Unknown admitted state
-    preserves caches. Caller serializes decisions with admission.lock.
-    """
-    jobs = []
+
+def _filesystem_root(path):
+    return os.path.ismount(path) or path.parent == path or path.parent.stat().st_dev != path.stat().st_dev
+
+
+def _paused_floors(app_home):
+    """Free space each pressure-frozen writer needs before its controller may thaw it."""
+    floors = {}
     registry = Path(app_home) / 'guard-reservations'
-    if registry.is_symlink():
-        raise RuntimeError('unsafe pressure registry')
-    for path in registry.glob('*.json'):
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor) as handle:
-            info = os.fstat(handle.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                raise RuntimeError('unsafe pressure reservation')
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                owned = False
-            except BlockingIOError:
-                owned = True
-            item = json.load(handle)
-            current = os.lstat(path)
-            if (current.st_dev,current.st_ino)!=(info.st_dev,info.st_ino):
-                raise RuntimeError('pressure reservation identity changed; caches preserved')
-        if item.get('state') not in ('running', 'waiting'):
-            continue
-        if not owned:
-            if item.get('state') == 'running' and not settled_without_writer(registry, item):
-                raise RuntimeError('admitted reservation has uncertain ownership; caches preserved')
-            continue
-        if not isinstance(item.get('created'), (int, float)) or not math.isfinite(item['created']):
-            raise RuntimeError('invalid pressure reservation age')
-        for v in item['volumes']:
-            for number in (v['reserve'], v.get('budget', item['budget']), item.get('consumed', {}).get(v['path'], 0)):
-                if not isinstance(number, (int, float)) or not math.isfinite(number) or number < 0:
-                    raise RuntimeError('invalid pressure reservation budget')
-        jobs.append(item)
-    paused = []
-    for item in jobs:
-        if item['state'] != 'running' or not item.get('runtime_file'): continue
-        runtime = registry / (item['id']+'.runtime')
-        if item['runtime_file'] != str(runtime) or runtime.resolve() != runtime:
-            raise RuntimeError('unsafe pressure runtime path; caches preserved')
+    try:
+        records = [entry.path for entry in os.scandir(registry) if entry.name.endswith('.json')]
+    except OSError:
+        return floors
+    for name in records:
         try:
+            path = Path(name)
+            if not _lease_held(path):
+                continue  # Only a held registry lock proves a live writer; PIDs do not.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor) as stream:
+                item = json.load(stream)
+            runtime = registry / (str(item['id']) + '.runtime')
+            if item.get('state') != 'running' or item.get('runtime_file') != str(runtime):
+                continue
             descriptor = os.open(runtime, os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor) as stream:
                 info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                    raise RuntimeError('unsafe pressure runtime; caches preserved')
                 observed = json.load(stream)
-            if (observed.get('version') != 1 or observed.get('owner') != item['owner']
-                    or observed.get('command_hash') != item.get('command_hash') or observed.get('job_id') != item['id']):
-                raise RuntimeError('pressure runtime identity mismatch; caches preserved')
-            if observed.get('state') == 'pressure-blocked':
-                hysteresis = observed.get('hysteresis_bytes')
-                if type(hysteresis) not in (int,float) or not math.isfinite(hysteresis) or hysteresis < 0:
-                    raise RuntimeError('invalid pressure runtime hysteresis; caches preserved')
-                paused.append(dict(item, _pressure_hysteresis=hysteresis))
-        except FileNotFoundError: continue
-        except (OSError,ValueError,TypeError) as error:
-            raise RuntimeError('pressure runtime cannot be inspected; caches preserved') from error
-    waiting = [j for j in jobs if j['state'] == 'waiting']
-    if not waiting and not paused: return {}
-    # Resume admitted frozen writers before accumulating additional write demand.
-    oldest = min(paused or waiting, key=lambda j: (j['created'], j['id']))
-    active = [j for j in jobs if j['state'] == 'running']
+            hysteresis = observed.get('hysteresis_bytes')
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077
+                    or observed.get('version') != 1 or observed.get('owner') != item['owner']
+                    or observed.get('command_hash') != item.get('command_hash') or observed.get('job_id') != item['id']
+                    or observed.get('state') != 'pressure-blocked'
+                    or type(hysteresis) not in (int, float) or not math.isfinite(hysteresis) or hysteresis < 0):
+                continue
+            for volume in item['volumes']:
+                reserve = volume['reserve']
+                if type(reserve) not in (int, float) or not math.isfinite(reserve) or reserve < 0:
+                    raise ValueError('invalid reserve')
+                floors[volume['path']] = max(floors.get(volume['path'], 0), reserve + hysteresis)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # One unreadable record is skipped; it never vetoes recovery.
+    return floors
+
+
+def low_water_floors(home, app_home):
+    """Free space kept available without being asked, so a starting job rarely meets its floor."""
+    try:
+        low_water = float(os.environ.get('DISK_JANITOR_LOW_WATER_GIB', LOW_WATER_GIB))
+    except ValueError:
+        low_water = LOW_WATER_GIB
+    if not math.isfinite(low_water) or low_water < 0:
+        low_water = LOW_WATER_GIB
+    floors = {str(_mount_of(home)): low_water * 2**30}
+    for name, required in _paused_floors(app_home).items():
+        floors[name] = max(floors.get(name, 0), required)
+    return floors
+
+
+def pressure_demand(app_home, floors=None, home=None):
+    """Per-device shortfall below the free space recovery maintains.
+
+    floors maps a mount to the free bytes required there; a refused job supplies its own
+    floor. Without one, the home filesystem is kept above the low-water mark and
+    pressure-frozen writers get what their thaw needs. No reservation record adds demand,
+    and an unreadable record or an absent mount is skipped.
+    """
+    if floors is None:
+        floors = low_water_floors(home or Path.home(), app_home)
     demand = {}
-    for volume in oldest['volumes']:
-        device = volume['device']
-        if device in demand:
+    for name, required in floors.items():
+        try:
+            path = Path(name)
+            if path.resolve() != path or not _filesystem_root(path):
+                continue
+            device, free = path.stat().st_dev, shutil.disk_usage(path).free
+        except OSError:
             continue
-        path = Path(volume['path'])
-        if path.resolve() != path or not os.path.ismount(path) or path.stat().st_dev != device:
-            raise RuntimeError('required pressure filesystem is missing or changed; caches preserved')
-        frozen = oldest.get('_pressure_hysteresis')
-        required = 0 if frozen is not None else max(v.get('budget', oldest['budget']) for v in oldest['volumes'] if v['device'] == device)
-        reserve = max([v['reserve'] for v in oldest['volumes'] if v['device'] == device] +
-                      [v['reserve'] for job in active for v in job['volumes'] if v['device'] == device])
-        if frozen is not None: reserve += frozen
-        claims = 0
-        for job in active:
-            same = [v for v in job['volumes'] if v['device'] == device]
-            if same:
-                claims += max(0, max(v.get('budget', job['budget']) for v in same) -
-                              max(job.get('consumed', {}).get(v['path'], 0) for v in same))
-        free = shutil.disk_usage(path).free
-        if frozen is not None: claims = 0  # Actual reserve, not a second whole-command commitment, permits safe thaw.
-        deficit = max(0, reserve + claims + required - free)
-        if deficit:
-            demand[device] = dict(path=str(path), deficit=deficit, required=required,
-                                  reserve=reserve, active_remaining=claims, free=free,
-                                  oldest_job_id=oldest['id'])
+        deficit = max(0, int(required) - free)
+        if deficit > demand.get(device, {}).get('deficit', 0):
+            demand[device] = dict(path=str(path), deficit=deficit, required=int(required), free=free)
     return demand
 
 
-def recover(home, app_home, *, apply=False, pressure_only=False, drain_seconds=30, observer=activity):
+def recover(home, app_home, *, apply=False, pressure_only=False, drain_seconds=30, observer=activity,
+            floors=None, time_limit=None):
     home, app_home = Path(home).resolve(), Path(app_home).resolve()
     app_home.mkdir(parents=True, exist_ok=True)
     report = {'applied': apply, 'pressure_only': pressure_only, 'started_at': time.time(), 'status': 'completed',
               'entries': [], 'removed_allocated_bytes': 0}
-    intent_path = app_home / 'maintenance-intent.json'
-    intent_token = None
+    deadline = time.monotonic() + time_limit if time_limit is not None else None
     with ExitStack() as stack:
         def fence(name):
             p = app_home / name
@@ -709,141 +925,129 @@ def recover(home, app_home, *, apply=False, pressure_only=False, drain_seconds=3
                 os.close(descriptor)
                 raise RuntimeError('unsafe recovery fence')
             return stack.enter_context(os.fdopen(descriptor, 'a+'))
-        recovery = fence('recovery.lock')
-        try:
-            fcntl.flock(recovery, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        # One recovery of this kind at a time; a second would only repeat the inspection.
+        # Guardians of earlier releases hold recovery.lock almost continuously while they
+        # wait, so a pressure pass has a fence of its own and is never starved by them.
+        if not _lock_within(fence('recovery-pass.lock'), 1 if pressure_only else 0):
             report['status'] = 'another-recovery-or-admission'
             return report
         admission, guard = fence('admission.lock'), fence('guard.lock')
+        if pressure_only:
+            if floors is None:
+                floors = low_water_floors(home, app_home)
+            demand = pressure_demand(app_home, floors)
+            report['initial_demand'] = demand
+            if not demand:
+                report['status'] = 'no-disk-pressure'
+                return report
+            # Running jobs share the guard fence for their whole life, so it is neither
+            # awaited nor taken here: per-unit activity proof decides what is idle, and no
+            # job waits for a recovery.
+        else:
+            for handle, name in ((fence('recovery.lock'), 'recovery.lock'), (admission, 'admission.lock'), (guard, 'guard.lock')):
+                if not _lock_within(handle, 0):
+                    report['status'] = 'active-guard' if name == 'guard.lock' else 'another-recovery-or-admission'
+                    return report
         try:
-            if pressure_only:
-                try: fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    report['status'] = 'another-recovery-or-admission'
-                    return report
+            _recover_batches(home, app_home, apply=apply, pressure_only=pressure_only,
+                             observer=observer, report=report, floors=floors, deadline=deadline)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            # Keep authoritative completed work if a later batch cannot be
+            # inspected. Direct callers still receive the original error;
+            # the CLI publishes this partial report and exits nonzero.
+            report.update(status='inspection-unavailable', error=str(error), completed_at=time.time())
+            for measure in report.get('filesystems', {}).values():
                 try:
-                    demand = pressure_demand(app_home)
-                    report['initial_demand'] = demand
-                    if not demand:
-                        report['status'] = 'no-disk-pressure'
-                        return report
-                    if apply:
-                        # Admission checks this short-lived intent while holding
-                        # its mutex. It drains finite users without disrupting any
-                        # service. No category lease is claimed without a proven
-                        # transitive runner contract; global exclusion remains.
-                        if intent_path.is_symlink():
-                            raise RuntimeError('unsafe maintenance intent')
-                        intent_token = uuid.uuid4().hex
-                        created = time.time()
-                        temporary = intent_path.with_name(intent_path.name + '.' + intent_token)
-                        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-                        with os.fdopen(descriptor, 'w') as stream:
-                            json.dump(dict(version=1, token=intent_token, created=created,
-                                           expires=created + min(120, max(1, drain_seconds + 60))), stream)
-                            stream.flush(); os.fsync(stream.fileno())
-                        os.replace(temporary, intent_path)
-                finally:
-                    fcntl.flock(admission, fcntl.LOCK_UN)
-                # Never wait for the global fence while holding admission.lock:
-                # existing guardians need that mutex to finish and release it.
-                deadline = time.monotonic() + (max(0, min(60, drain_seconds)) if apply else 0)
-                while True:
-                    try:
-                        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            report['status'] = 'active-guard'
-                            return report
-                        time.sleep(min(.05, max(0, deadline - time.monotonic())))
-                # Once global exclusion is held, admission cannot launch a child.
-                # Waiting for its short decision here cannot deadlock a finisher.
-                fcntl.flock(admission, fcntl.LOCK_EX)
-                demand = pressure_demand(app_home)
-                if not demand:
-                    report['status'] = 'no-disk-pressure'
-                    return report
-            else:
-                for handle, name in ((admission, 'admission.lock'), (guard, 'guard.lock')):
-                    try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        report['status'] = 'active-guard' if name == 'guard.lock' else 'another-recovery-or-admission'
-                        return report
-            try:
-                _recover_batches(home, app_home, apply=apply, pressure_only=pressure_only,
-                                 observer=observer, report=report)
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                # Keep authoritative completed work if a later batch cannot be
-                # inspected. Direct callers still receive the original error;
-                # the CLI publishes this partial report and exits nonzero.
-                report.update(status='inspection-unavailable', error=str(error), completed_at=time.time())
-                for measure in report.get('filesystems', {}).values():
-                    try:
-                        measure['free_after'] = shutil.disk_usage(measure['path']).free
-                        measure['net_free_bytes'] = measure['free_after'] - measure['free_before']
-                    except OSError as measurement_error:
-                        measure['measurement_error'] = str(measurement_error)
-                error.recovery_report = report
-                raise
-            report['completed_at'] = time.time()
-        finally:
-            if intent_token:
-                # Only this recovery's intent is removed; a crashed owner leaves
-                # an expiring hint which cannot fence work without recovery.lock.
-                try:
-                    if not intent_path.is_symlink() and json.loads(intent_path.read_text()).get('token') == intent_token:
-                        intent_path.unlink()
-                except (FileNotFoundError, ValueError):
-                    pass
+                    measure['free_after'] = shutil.disk_usage(measure['path']).free
+                    measure['net_free_bytes'] = measure['free_after'] - measure['free_before']
+                except OSError as measurement_error:
+                    measure['measurement_error'] = str(measurement_error)
+            error.recovery_report = report
+            raise
+        report['completed_at'] = time.time()
     return report
 
 
+def _runtime():
+    # Record retirement and preemption requests live with the runtime controller, which a
+    # guardian already loads; this module is also run as a script and replaced in fixtures.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import capacity
+    return capacity
+
+
+def sweep_registry(app_home):
+    return _runtime().sweep_registry(app_home)
+
+
 def request_preemption(app_home, requester_id):
-    """Request cooperative yield; only the owning guardian may stop its child."""
-    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', requester_id):
-        return None
-    registry = Path(app_home) / 'guard-reservations'
-    requester_path = registry / (requester_id + '.json')
-    if requester_path.is_symlink():
-        return None
-    requester = json.loads(requester_path.read_text())
-    if requester.get('state') != 'waiting':
-        return None
-    for p in registry.glob('*.json'):
-        if p.is_symlink() or p == requester_path:
-            continue
+    return _runtime().request_preemption(app_home, requester_id)
+
+
+def start_stalled(app_home, seconds, interval=2):
+    """Watch the queue; a job waiting beside a free slot is a fault, so let the oldest start.
+
+    The same oldest ticket seen twice with a slot free gets a grant its waiter honours
+    without regard to order. Nothing is signalled and no job is started from here.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from capacity import queue_view
+    granted, previous = [], None
+    end = time.monotonic() + seconds
+    while True:
+        view = queue_view(app_home)
+        oldest = view['waiting'][0] if view['waiting'] and view['busy'] < view['limit'] else None
+        if oldest and oldest == previous:
+            grant = Path(app_home) / 'queue' / (oldest + '.go')
+            if not grant.is_symlink() and not grant.exists():
+                with os.fdopen(os.open(grant, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600), 'w') as output:
+                    json.dump(dict(at=time.time(), busy=view['busy'], limit=view['limit']), output)
+                granted.append(oldest)
+        previous = oldest
+        if time.monotonic() + interval >= end:
+            return granted
+        time.sleep(interval)
+
+
+def watchdog(home, app_home, monitor_seconds=50):
+    """One scheduled pass: retire dead registry records, restore free space to low water,
+    then watch for a job left waiting beside a free slot."""
+    report = {'started_at': time.time()}
+    began = time.monotonic()
+    try:
+        # First, before any slower work: a waiter beside a free slot is started promptly.
+        report['stalled_waiters_started'] = start_stalled(app_home, min(6, monitor_seconds))
+    except (OSError, ValueError, ImportError) as error:
+        report['stalled_waiters_started'] = {'error': str(error)}
+    try:
+        report['registry'] = sweep_registry(app_home)
+    except (OSError, ValueError, RuntimeError) as error:
+        report['registry'] = {'error': str(error)}
+    # A pass that found nothing to remove is not repeated every minute: discovery walks
+    # every checkout and cache, and what is busy now is usually busy a minute later.
+    retry_at = 0
+    try:
+        with open(Path(app_home) / 'watchdog-last.json') as stream:
+            retry_at = float(json.load(stream).get('recovery_retry_at', 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if time.time() < retry_at <= time.time() + 600:
+        report.update(recovery={'status': 'waiting-after-empty-pass'}, recovery_retry_at=retry_at)
+    else:
         try:
-            target = json.loads(p.read_text())
-            if (not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', str(target.get('id','')))
-                    or target.get('state') != 'running' or target.get('restartable') is not True
-                    or target.get('restart_kind') not in ('build', 'test', 'preview')
-                    or target.get('class') == 'service' or target.get('preemptions', 0) >= 2
-                    or not target.get('child') or target.get('class') == requester.get('class')):
-                continue
-            if requester.get('class') != 'feedback' or target.get('class') != 'build':
-                continue
-            # A held registry lock confirms an owning guardian is still present.
-            with p.open('r+') as handle:
-                try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    continue
-                except BlockingIOError:
-                    pass
-            message = {'id': target['id'], 'owner': target['owner'],
-                       'command_hash': target['command_hash'], 'child': target['child'],
-                       'requester': requester_id, 'created': time.time()}
-            destination = registry / (target['id'] + '.preempt-request')
-            if destination.is_symlink():
-                continue
-            temporary = destination.with_name(destination.name + '.' + str(os.getpid()))
-            temporary.write_text(json.dumps(message))
-            os.replace(temporary, destination)
-            return target['id']
-        except (OSError, ValueError, KeyError):
-            continue
-    return None
+            report['recovery'] = recover(home, app_home, apply=True, pressure_only=True, time_limit=45)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            report['recovery'] = getattr(error, 'recovery_report', None) or {
+                'status': 'inspection-unavailable', 'error': str(error), 'removed_allocated_bytes': 0}
+        if report['recovery'].get('status') == 'completed' and not report['recovery'].get('removed_allocated_bytes'):
+            report['recovery_retry_at'] = time.time() + 600
+    try:
+        if isinstance(report['stalled_waiters_started'], list):
+            report['stalled_waiters_started'] += start_stalled(app_home, monitor_seconds - (time.monotonic() - began))
+    except (OSError, ValueError, ImportError) as error:
+        report['stalled_waiters_started'] = {'error': str(error)}
+    report['completed_at'] = time.time()
+    return report
 
 
 def main():
@@ -854,14 +1058,31 @@ def main():
     parser.add_argument('--report', type=Path)
     parser.add_argument('--requester')
     parser.add_argument('--pressure-only', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--need', action='append', default=[], metavar='MOUNT=BYTES', help=argparse.SUPPRESS)
+    parser.add_argument('--time-limit', type=float, help=argparse.SUPPRESS)
+    parser.add_argument('--watchdog', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     home = Path.home()
     app_home = Path(os.environ.get('DISK_JANITOR_HOME', str(home / '.disk-janitor')))
+    if args.watchdog:
+        result = watchdog(home, app_home)
+        destination = app_home / 'watchdog-last.json'
+        temporary = destination.with_name(destination.name + '.' + str(os.getpid()))
+        temporary.write_text(json.dumps(result) + '\n')
+        os.replace(temporary, destination)
+        return
     try:
+        floors = None
+        for need in args.need:
+            mount, _, required = need.rpartition('=')
+            floors = dict(floors or {}, **{mount: float(required)})
+        if args.time_limit is not None and not (math.isfinite(args.time_limit) and args.time_limit > 0):
+            raise ValueError('invalid time limit')
         # Preserve explicit bounded cooperative yield before waiting for the
         # global fence; services and unmarked jobs remain untouched.
         preempted = request_preemption(app_home, args.requester) if args.requester else None
-        result = recover(home, app_home, apply=args.apply, pressure_only=args.pressure_only)
+        result = recover(home, app_home, apply=args.apply, pressure_only=args.pressure_only,
+                         floors=floors, time_limit=args.time_limit)
         if args.requester:
             result['preemption_requested'] = preempted
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

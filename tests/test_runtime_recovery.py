@@ -13,10 +13,12 @@ import test_jobs as fixtures
 
 class RuntimeRecoveryTests(fixtures.JobTests):
     def test_guardian_loss_before_commit_is_recovered_in_surviving_worker_context(self):
-        self.app.mkdir(parents=True, exist_ok=True)
-        with (self.app/'admission.lock').open('a') as gate:
+        (self.app/'slots').mkdir(parents=True, exist_ok=True)
+        self.env['DISK_JANITOR_MAX_RUNNING'] = '1'
+        with (self.app/'slots/slot-0.lock').open('a') as gate:
             fcntl.flock(gate, fcntl.LOCK_EX)
-            job = self.submit('import os;from pathlib import Path;Path("prelaunch-once").open("a").write(os.environ["JOB_TEST_VALUE"])')
+            job = self.submit('import os;from pathlib import Path;Path("prelaunch-once").open("a").write(os.environ["JOB_TEST_VALUE"])  # build')
+            self.until(lambda: self.status(job).get('reason'))
             state = self.status(job)
             os.kill(state['guardian_pid'], signal.SIGKILL)
             self.until(lambda: self.status(job).get('guardian_pid') != state['guardian_pid'])

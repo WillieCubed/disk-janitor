@@ -73,9 +73,9 @@ class JobCoreTests(unittest.TestCase):
 
     def test_control_cancels_waiting_job_without_signal(self):
         control = self.control('cancel')
-        self.env['FIXTURE_FREE_GIB'] = '.02'
-        p = self.spawn('cancel', extra=['--job-control-file', str(control)])
-        self.until(lambda: (self.app / 'guard-reservations/cancel.json').exists() or p.poll() is not None)
+        self.hold_slot()
+        p = self.spawn('cancel', extra=['--job-control-file', str(control), '--max-running', '1'])
+        self.until(lambda: len(list((self.app / 'queue').glob('*-cancel'))) == 1 or p.poll() is not None)
         control.write_text(json.dumps(dict(backend_job_id='cancel', owner='cancel', cancel_requested=True)))
         self.finish(p, 143)
         self.assertFalse((self.root / 'cancel').exists())
@@ -118,21 +118,30 @@ class JobCoreTests(unittest.TestCase):
         self.finish(p, 125)
         self.assertFalse((self.root / 'foreign').exists())
 
-    def test_submitted_age_is_preserved_and_blocks_conflicting_backfill(self):
-        holder = self.spawn('holder', budget='.03', code='from pathlib import Path;import time;Path(' + repr(str(self.root / 'holder')) + ').touch();end=time.monotonic()+5;exec("while not Path(' + repr(str(self.root / 'release')) + ').exists() and time.monotonic()<end: time.sleep(.01)")')
-        self.until(lambda: (self.root / 'holder').exists())
+    def hold_slot(self):
+        (self.app / 'slots').mkdir(mode=0o700, exist_ok=True)
+        slot = (self.app / 'slots/slot-0.lock').open('a')
+        fcntl.flock(slot, fcntl.LOCK_EX)
+        self.addCleanup(slot.close)
+        return slot
+
+    def test_submitted_age_is_preserved_and_orders_the_queue(self):
+        slot = self.hold_slot()
         old = time.time() - 120
-        aged = self.spawn('aged', budget='.04', extra=['--submitted-at', str(old)])
-        self.until(lambda: (self.app / 'guard-reservations/aged.json').exists() or aged.poll() is not None)
-        small = self.spawn('small', budget='.01')
-        independent = self.spawn('independent', budget='0')
-        self.finish(independent)
-        time.sleep(.2)
-        self.assertFalse((self.root / 'small').exists(), 'backfill must drain conflicting disk for the aged large job')
-        record = json.loads((self.app / 'guard-reservations/aged.json').read_text())
-        self.assertEqual(record['created'], old)
+        late = self.spawn('late', extra=['--max-running', '1'])
+        self.until(lambda: (self.app / 'guard-reservations/late.json').exists())
+        hold = ('from pathlib import Path;import time;Path(' + repr(str(self.root / 'aged')) + ').touch();end=time.monotonic()+5;'
+                'exec("while not Path(' + repr(str(self.root / 'release')) + ').exists() and time.monotonic()<end: time.sleep(.01)")')
+        aged = self.spawn('aged', extra=['--max-running', '1', '--submitted-at', str(old)], code=hold)
+        self.until(lambda: len(list((self.app / 'queue').glob('*-aged'))) == 1)
+        self.assertEqual(json.loads((self.app / 'guard-reservations/aged.json').read_text())['created'], old)
+        slot.close()
+        self.until(lambda: (self.root / 'aged').exists())
+        time.sleep(.6)
+        self.assertFalse((self.root / 'late').exists(), 'the earlier submission takes the freed slot first')
         (self.root / 'release').touch()
-        for p in (holder, aged, small): self.finish(p)
+        for p in (aged, late): self.finish(p)
+        self.assertTrue((self.root / 'late').exists())
 
     def test_supervisor_log_survives_guardian_crash_and_is_bounded(self):
         log = self.app / 'command.log'
@@ -157,40 +166,6 @@ class JobCoreTests(unittest.TestCase):
         self.finish(self.spawn('background', extra=['--job-log-file', str(log)], code=code))
         self.assertLess(time.monotonic() - started, 3)
         self.assertIn(b'leader done', log.read_bytes())
-
-    def test_capacity_is_measured_after_admission_mutex(self):
-        # Hold admission until the guard starts waiting, then lower physical free.
-        capacity = self.root / 'capacity'
-        capacity.write_text('.1')
-        self.env['FIXTURE_FREE_FILE'] = str(capacity)
-        # Pause the first observe call. A pre-lock measurement would allow stale
-        # free bytes to pass after we change capacity while holding the mutex.
-        trace = self.root / 'sampled'
-        gate = self.root / 'sample-release'
-        bootstrap = BOOTSTRAP.replace('original=subprocess.run',
-            'original_usage=shutil.disk_usage\n'
-            'def usage(path):\n'
-            ' result=original_usage(path)\n'
-            ' if not Path(' + repr(str(trace)) + ').exists():\n'
-            '  Path(' + repr(str(trace)) + ').touch()\n'
-            '  while not Path(' + repr(str(gate)) + ').exists(): __import__("time").sleep(.01)\n'
-            ' return result\n'
-            'shutil.disk_usage=usage\noriginal=subprocess.run')
-        p = self.spawn('stale', extra=['--once'], bootstrap=bootstrap)
-        self.until(trace.exists)
-        with (self.app / 'admission.lock').open('a') as lock:
-            try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                # Correct implementation already owns the admission mutex while
-                # sampling. Let that exact decision finish with its valid sample.
-                gate.touch()
-                self.finish(p)
-                return
-            capacity.write_text('.02')
-            gate.touch()
-            time.sleep(.1)
-        self.finish(p, 75)
-        self.assertFalse((self.root / 'stale').exists())
 
 
 class PressureRecoveryTests(unittest.TestCase):
@@ -223,60 +198,58 @@ class PressureRecoveryTests(unittest.TestCase):
         path.write_bytes(b'generated')
         return path
 
+    LOW_WATER = 50  # bytes; the fixtures count in bytes
+
+    def measured(self, free):
+        return (patch.object(self.recovery.shutil, 'disk_usage', side_effect=lambda _: SimpleNamespace(free=free())),
+                patch.object(self.recovery.os.path, 'ismount', return_value=True),
+                patch.dict(os.environ, {'DISK_JANITOR_LOW_WATER_GIB': repr(self.LOW_WATER / 2**30)}))
+
     def recover(self, free):
-        with patch.object(self.recovery.shutil, 'disk_usage', side_effect=lambda _: SimpleNamespace(free=free())), patch.object(self.recovery.os.path, 'ismount', return_value=True):
+        usage, mounted, low_water = self.measured(free)
+        with usage, mounted, low_water:
             return self.recovery.recover(self.root, self.app, apply=True, pressure_only=True, observer=lambda: ([], []))
 
-    def test_hourly_pressure_without_disk_demand_preserves_cache(self):
+    def demand(self, free):
+        usage, mounted, low_water = self.measured(lambda: free)
+        with usage, mounted, low_water:
+            return self.recovery.pressure_demand(self.app, home=self.root)
+
+    def test_hourly_pressure_above_low_water_preserves_cache(self):
         cache = self.cache('.gradle/caches/build-cache-1/11111111111111111111111111111111')
         self.job('memory-only', 0)
         result = self.recover(lambda: 100)
         self.assertTrue(cache.exists())
         self.assertEqual(result['status'], 'no-disk-pressure')
 
-    def test_demand_uses_oldest_waiter_not_sum(self):
+    def test_reservation_records_add_no_demand(self):
         self.job('oldest', 30, created=1)
         self.job('later', 1000, created=2)
-        with patch.object(self.recovery.shutil, 'disk_usage', return_value=SimpleNamespace(free=60)), patch.object(self.recovery.os.path, 'ismount', return_value=True):
-            self.assertEqual(self.recovery.pressure_demand(self.app), {})
-
-    def test_active_remaining_commitments_reduce_available_space(self):
-        self.job('oldest', 30)
         self.job('active', 50, state='running', consumed=40)
-        with patch.object(self.recovery.shutil, 'disk_usage', return_value=SimpleNamespace(free=55)), patch.object(self.recovery.os.path, 'ismount', return_value=True):
-            demand = self.recovery.pressure_demand(self.app)
-            self.assertEqual(demand[self.root.stat().st_dev]['deficit'], 5)
+        self.assertEqual(self.demand(60), {})
+
+    def test_demand_is_the_shortfall_below_low_water(self):
+        self.job('waiting', 10 ** 12)
+        demand = self.demand(45)
+        self.assertEqual(demand[self.root.stat().st_dev]['deficit'], 5)
 
     def test_recheck_stops_after_first_removal_fits(self):
         cargo = self.cache('.cache/cargo-target/debug/incremental/crate/object.o')
         gradle = self.cache('.gradle/caches/build-cache-1/11111111111111111111111111111111')
-        self.job('oldest', 30)
         self.recover(lambda: 40 if cargo.exists() else 100)
         self.assertFalse(cargo.exists())
         self.assertTrue(gradle.exists())
 
-    def test_pressure_drain_never_holds_admission_while_waiting(self):
-        self.job('oldest', 30)
+    def test_pressure_recovery_needs_no_drain_no_admission_lock_and_no_intent(self):
         cache = self.cache('.gradle/caches/build-cache-1/11111111111111111111111111111111')
-        outcomes = []
-        with (self.app / 'guard.lock').open('a') as guard:
+        with (self.app / 'guard.lock').open('a') as guard, (self.app / 'admission.lock').open('a') as admission:
             fcntl.flock(guard, fcntl.LOCK_SH)
-            with patch.object(self.recovery.shutil, 'disk_usage', return_value=SimpleNamespace(free=40)), patch.object(self.recovery.os.path, 'ismount', return_value=True):
-                thread = threading.Thread(target=lambda: outcomes.append(self.recovery.recover(
-                    self.root, self.app, apply=True, pressure_only=True, drain_seconds=.3, observer=lambda: ([], []))))
-                thread.start()
-                try:
-                    end = time.monotonic() + 2
-                    while not (self.app / 'maintenance-intent.json').exists() and time.monotonic() < end:
-                        time.sleep(.005)
-                    self.assertTrue((self.app / 'maintenance-intent.json').exists())
-                    with (self.app / 'admission.lock').open('a') as admission:
-                        fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                finally:
-                    thread.join(timeout=3)
-                self.assertFalse(thread.is_alive())
-        self.assertEqual(outcomes[0]['status'], 'active-guard')
-        self.assertTrue(cache.exists())
+            fcntl.flock(admission, fcntl.LOCK_EX)
+            started = time.monotonic()
+            result = self.recover(lambda: 40 if cache.exists() else 100)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(result['status'], 'completed')
+        self.assertFalse(cache.exists())
         self.assertFalse((self.app / 'maintenance-intent.json').exists())
 
 
