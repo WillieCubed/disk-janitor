@@ -1,0 +1,104 @@
+--- a/pool_runtime.py
++++ b/pool_runtime.py
+@@ -19,6 +19,7 @@
+ import pool_policy as policy
+ import runner_fleet as fleet
+ import process_control as control
++runnerpools_bridge = control
+ 
+ GIB = 1024**3
+ ACTIVE = {"creating", "registered", "busy", "cleanup", "cleanup-required"}
+@@ -162,6 +163,7 @@
+         availability=None,
+         allow_image_upgrade=False,
+         reclaim=None,
++        resource_bridge=None,
+     ):
+         self.profile, self.state = validate(profile), Path(state)
+         self.global_root = (
+@@ -209,6 +211,8 @@
+         )
+         self.demand = demand or fleet.demand
+         self.reclaim = reclaim
++        self.resource_bridge = resource_bridge or runnerpools_bridge.BrokerBridge()
++        self._shared_bridge = None
+         self._last_repository = {}
+         self.availability = availability or (
+             lambda role: fleet.admission(role, fleet.observe())
+@@ -241,7 +245,20 @@
+                 _RESOURCE_MUTEX,
+                 control.file_lock(self.global_root / ".resources.lock"),
+             ):
+-                yield
++                with self.resource_bridge.transaction(self.global_root) as bridge:
++                    self._shared_bridge = bridge
++                    try:
++                        if bridge:
++                            bridge.publish(self._scan(), self.global_root.stat().st_dev)
++                        yield
++                    finally:
++                        try:
++                            if bridge:
++                                bridge.publish(self._scan(), self.global_root.stat().st_dev)
++                        finally:
++                            self._shared_bridge = None
++        except runnerpools_bridge.BridgeUnavailable:
++            raise CapacityWaiting("Shared local/CI admission is unavailable; existing work is preserved.") from None
+         except control.StateError:
+             raise Failure(
+                 "Pool resource state is locked or unsafe; preserve it and retry after inspection."
+@@ -379,6 +396,12 @@
+         return result
+ 
+     def _write(self, platform, record):
++        if self._shared_bridge and record["state"] in ACTIVE:
++            # Export the claim durably before the authoritative journal can
++            # admit VM work. An interrupted commit remains conservative.
++            records = [r for r in self._scan() if
++                       (r["profile_id"], r["platform"]) != (record["profile_id"], platform)]
++            self._shared_bridge.publish(records + [record], self.global_root.stat().st_dev)
+         control.atomic_write(
+             self._path(platform),
+             (json.dumps(record, sort_keys=True) + "\n").encode(),
+@@ -601,6 +624,10 @@
+                 "Pool began draining while waiting for resources; no generation admitted.",
+             )
+             active = self._scan()
++            local = self._shared_bridge.local_claims() if self._shared_bridge else []
++            device = self.global_root.stat().st_dev
++            local_disk = sum(max((v["budget"] for v in item["volumes"] if v["device"] == device), default=0) for item in local)
++            local_reserve = max([0] + [v["reserve"] for item in local for v in item["volumes"] if v["device"] == device])
+             if self.profile.get("fleet") and len(active) >= 2:
+                 raise CapacityWaiting(
+                     "Managed VM capacity is reserved; waiting for a job to finish."
+@@ -648,8 +675,10 @@
+                 <= memory // 2,
+                 "Managed pools would exceed half the host physical memory.",
+             )
++            if sum(r["resources"]["memory_bytes"] for r in active) + resources["memory_bytes"] + sum(item["memory"] for item in local) > memory:
++                raise CapacityWaiting("Shared local/CI memory commitments are occupied; waiting for completion.")
+             reserve = max(
+-                [resources["reserve_bytes"]]
++                [resources["reserve_bytes"], local_reserve]
+                 + [r["resources"]["reserve_bytes"] for r in active]
+             )
+             require(
+@@ -659,7 +688,7 @@
+             # Admit a job only when what it and every running job are
+             # expected to write fits beside the reserve. The execution
+             # watchdog stops any job that writes more than expected.
+-            budget = resources["disk_bytes"] + sum(
++            budget = resources["disk_bytes"] + local_disk + sum(
+                 r["resources"]["disk_bytes"] for r in active
+             )
+             if free < reserve + budget:
+@@ -1284,6 +1313,9 @@
+             raise
+ 
+     def run_once(self, platform):
++        if self.resource_bridge.binding() is not None:
++            with self._resources():
++                pass  # Refresh joined admission for idle/unavailable/drained pools.
+         self._path(platform)
+         self._require_image_available(platform)
+         available = getattr(self.worker, "session_available", None)

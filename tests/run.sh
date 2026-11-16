@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# No-bats fallback test runner: same round-trip assertions as roundtrip.bats.
+# Portable installation/uninstallation round-trip checks in a disposable home.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SB="$(mktemp -d)"
@@ -11,7 +11,10 @@ dj() { env -i HOME="$SB" PATH="$PATH" DISK_JANITOR_HOME="$SB/.dj" DISK_JANITOR_N
 fail=0
 check() { if eval "$2"; then printf '  ✓ %s\n' "$1"; else printf '  ✗ %s\n' "$1"; fail=1; fi; }
 
-dj install --with-agent-guidance >/dev/null 2>&1
+if ! dj install --with-agent-guidance >"$SB/install.log" 2>&1; then
+  cat "$SB/install.log"
+  fail=1
+fi
 echo "after install:"
 check "cargo config written"   "grep -q 'managed-by: disk-janitor' '$SB/.cargo/config.toml'"
 check "npmrc set"              "grep -q 'package-import-method=' '$SB/.npmrc'"
@@ -20,7 +23,10 @@ check "guidance block added"   "grep -q 'disk-janitor:worktrees' '$SB/.codex/AGE
 check "PATH symlink created"   "[ -L '$SB/.local/bin/disk-janitor' ]"
 check "scheduler state saved"  "[ -f '$SB/.dj/state/scheduler' ]"
 
-dj uninstall >/dev/null 2>&1
+if ! dj uninstall >"$SB/uninstall.log" 2>&1; then
+  cat "$SB/uninstall.log"
+  fail=1
+fi
 echo "after uninstall:"
 check "cargo config removed"   "[ ! -e '$SB/.cargo/config.toml' ]"
 check "original npmrc restored" "grep -q 'prefer-frozen-lockfile=true' '$SB/.npmrc'"
@@ -28,5 +34,15 @@ check "guidance block removed"  "! grep -q 'disk-janitor:worktrees' '$SB/.codex/
 check "original guidance intact" "grep -q 'existing codex guidance' '$SB/.codex/AGENTS.md'"
 check "symlink removed"        "[ ! -e '$SB/.local/bin/disk-janitor' ]"
 
-rm -r "$SB"
-[ "$fail" -eq 0 ] && echo "ALL PASS" || { echo "FAILURES"; exit 1; }
+# Only this runner's freshly-created disposable home is made writable again:
+# installed immutable release directories are intentionally retained on uninstall.
+if ! chmod -R u+w "$SB" || ! rm -r "$SB"; then
+  printf '  ✗ disposable test home cleanup\n'
+  fail=1
+fi
+if [ "$fail" -eq 0 ]; then
+  echo "ALL PASS"
+else
+  echo "FAILURES"
+  exit 1
+fi

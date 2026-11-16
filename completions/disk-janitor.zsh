@@ -1,30 +1,14 @@
 #compdef disk-janitor
-# zsh completion for disk-janitor
-
 _disk-janitor() {
-  local -a commands
-  commands=(
-    'install:configure dedup + schedule the weekly cleanup'
-    'uninstall:reverse everything cleanly'
-    'run:run the cleanup now'
-    'status:show configuration and free space'
-    'logs:show or follow the run log'
-    'config:print the config file path and contents'
-    'version:print version'
-    'help:show help'
-  )
-
-  if (( CURRENT == 2 )); then
-    _describe -t commands 'disk-janitor command' commands
-    return
-  fi
-
-  case "${words[2]}" in
-    install)   _arguments '--with-agent-guidance[manage worktree guidance in agent config files]' '--dry-run[preview only]' ;;
-    uninstall) _arguments '--purge[also remove cargo-sweep and app state]' ;;
-    run)       _arguments '(--dry-run -n)'{--dry-run,-n}'[report candidates, delete nothing]' ;;
-    logs)      _arguments '-f[follow the log]' ;;
+  local -a commands jobs
+  commands=('submit:submit a new command' 'status:inspect jobs and capacity' 'logs:read job output' 'wait:wait for a terminal outcome' 'cancel:cancel your job' 'help:show help' 'version:show version')
+  if (( CURRENT == 2 )); then _describe -t commands 'command' commands; return; fi
+  if [[ ${words[2]} == submit ]]; then _command_names; return; fi
+  jobs=( ${DISK_JANITOR_HOME:-$HOME/.disk-janitor}/jobs/j-*(N:t) )
+  _describe -t jobs 'job' jobs
+  case ${words[2]} in
+    status) _arguments '--json[machine-readable status]' ;;
+    logs) _arguments '-f[follow output]' '--follow[follow output]' ;;
   esac
 }
-
 _disk-janitor "$@"
