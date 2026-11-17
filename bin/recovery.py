@@ -640,9 +640,10 @@ def _cap_service_logs(home, report, note, *, apply, demand=None):
             note(entry, 'preserved', error)
 
 
-CACHE_ROOTS = (('Cargo build output', '.cache/cargo-target'), ('Gradle caches', '.gradle/caches'),
-               ('Xcode DerivedData', 'Library/Developer/Xcode/DerivedData'), ('pnpm store', 'Library/pnpm/store'),
-               ('npm cache', '.npm'))
+# (label, location, whether recovery reclaims inside it)
+CACHE_ROOTS = (('Cargo build output', '.cache/cargo-target', True), ('Gradle caches', '.gradle/caches', True),
+               ('Xcode DerivedData', 'Library/Developer/Xcode/DerivedData', True),
+               ('pnpm store', 'Library/pnpm/store', False), ('npm cache', '.npm', False))
 
 
 def _worktree_folder(checkout, home):
@@ -677,7 +678,8 @@ def space(home, observer=activity):
         folder = str(_worktree_folder(checkout, home))
         count, total = folders.get(folder, (0, 0))
         folders[folder] = (count + 1, total + size)
-    caches = {label: _allocated(home / relative) for label, relative in CACHE_ROOTS if (home / relative).is_dir()}
+    caches = {label: dict(bytes=_allocated(home / relative), reclaimed=reclaimed)
+              for label, relative, reclaimed in CACHE_ROOTS if (home / relative).is_dir()}
     cap = _log_cap_bytes()
     logs = [dict(path=str(p), bytes=p.lstat().st_blocks * 512, over_cap=p.lstat().st_size > cap)
             for p in service_logs(home)]
@@ -709,9 +711,10 @@ def _render_space(result, home):
         lines.append('  the next recovery pass retires:')
         for item in sorted(tree['ready'], key=lambda i: -i['bytes']):
             lines.append(f"    {tilde(item['path'])}  {gb(item['bytes']).strip()}  ({item['finished']})")
-    lines += ['', 'Build caches (reclaimed when idle)']
-    for label, size in result['caches'].items():
-        lines.append(f'  {label:<30}      {gb(size)}')
+    lines += ['', 'Build caches']
+    for label, cache in result['caches'].items():
+        note = 'reclaimed when idle' if cache['reclaimed'] else 'not reclaimed'
+        lines.append(f"  {label:<30}      {gb(cache['bytes'])}  ({note})")
     logs = result['service_logs']
     over = [log for log in logs if log['over_cap']]
     lines += ['', f"Service logs  {len(logs)} files  {gb(sum(log['bytes'] for log in logs))}  "
