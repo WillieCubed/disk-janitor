@@ -557,6 +557,81 @@ def _retire_worktrees(home, report, note, view, view_now, *, apply, demand=None,
             note(entry, 'preserved', error)
 
 
+LOG_TAIL_BYTES = 8 * 1024 ** 2
+
+
+def _log_cap_bytes():
+    try:
+        megabytes = float(os.environ.get('DISK_JANITOR_LOG_CAP_MB', '256'))
+    except ValueError:
+        megabytes = 256
+    return int(max(megabytes, 16) * 1024 ** 2)
+
+
+def service_logs(home):
+    """Output files of the user's launchd agents: launchd appends to them and never rotates them."""
+    import plistlib
+    agents = home / 'Library/LaunchAgents'
+    found = []
+    try:
+        entries = sorted(agents.iterdir())
+    except OSError:
+        return found
+    for plist in entries:
+        if plist.suffix != '.plist' or not _plain(plist):
+            continue
+        try:
+            with plist.open('rb') as stream:
+                job = plistlib.load(stream)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        if not isinstance(job, dict):
+            continue
+        for key in ('StandardOutPath', 'StandardErrorPath'):
+            name = job.get(key)
+            if not isinstance(name, str) or not name.startswith('/'):
+                continue
+            path = Path(name)
+            try:
+                if path not in found and path.resolve() == path and path.is_relative_to(home) and _plain(path):
+                    found.append(path)
+            except OSError:
+                continue
+    return found
+
+
+def _cap_service_logs(home, report, note, *, apply, demand=None):
+    """Keep each oversized service log's recent tail in <log>.1 and empty the log in place.
+
+    launchd opens these files for appending, so the service keeps writing at the new end;
+    truncating in place, not replacing the file, is what lets it continue without a restart.
+    """
+    cap = _log_cap_bytes()
+    for path in service_logs(home):
+        entry = dict(kind='service-log', path=str(path), allocated_bytes=0)
+        try:
+            info = path.lstat()
+            if info.st_size <= cap or (demand is not None and info.st_dev not in demand):
+                continue
+            entry['allocated_bytes'] = info.st_blocks * 512
+            if not apply:
+                note(entry, 'eligible'); continue
+            tail = path.with_name(path.name + '.1')
+            if os.path.lexists(tail) and not _plain(tail):
+                note(entry, 'preserved', 'previous tail is not a plain file'); continue
+            temporary = path.with_name(path.name + '.1.' + str(os.getpid()))
+            with path.open('rb') as source, temporary.open('wb') as copy:
+                source.seek(max(0, info.st_size - LOG_TAIL_BYTES))
+                source.readline()  # start the kept tail at a line boundary
+                shutil.copyfileobj(source, copy)
+            os.replace(temporary, tail)
+            os.truncate(path, 0)
+            note(entry, 'removed')
+            report['removed_allocated_bytes'] += entry['allocated_bytes']
+        except OSError as error:
+            note(entry, 'preserved', error)
+
+
 def candidates(home, occupied=None, deadline=None):
     # Outputs of checkouts nobody occupies go first: shared caches still serve active work.
     for discover in (lambda root: _worktree_candidates(root, occupied, deadline),
@@ -928,6 +1003,7 @@ def _recover_batches(home, app_home, *, apply, pressure_only, observer, report, 
     # Finished checkouts go first: retiring one frees its build output with it.
     _retire_worktrees(home, report, note, view, lambda: _activity_view(observer, home, app_home),
                       apply=apply, demand=demand if pressure_only else None, deadline=deadline)
+    _cap_service_logs(home, report, note, apply=apply, demand=demand if pressure_only else None)
 
     for kind, path in candidates(home, occupied, deadline):
         if deadline is not None and time.monotonic() >= deadline:
