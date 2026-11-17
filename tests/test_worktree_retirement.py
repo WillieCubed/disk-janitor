@@ -58,6 +58,24 @@ class WorktreeRetirementTests(unittest.TestCase):
     def recover(self, apply=True, paths=()):
         return self.recovery.recover(self.home, self.app, apply=apply, observer=lambda: ([], list(paths)))
 
+    def scheduled(self, maintain):
+        # The scheduled pass with plenty of free space: no device is below its floor.
+        return self.recovery.recover(self.home, self.app, apply=True, pressure_only=True, maintain=maintain,
+                                     floors={str(self.home): 0}, observer=lambda: ([], []))
+
+    def test_scheduled_maintenance_retires_finished_worktrees_without_disk_pressure(self):
+        tree = self.worktree('merged', 'feature/merged')
+        report = self.scheduled(maintain=True)
+        self.assertEqual(report['status'], 'no-disk-pressure')
+        self.assertEqual(self.statuses(report)[str(tree)], 'removed')
+        self.assertFalse(tree.exists())
+
+    def test_pressure_pass_without_maintenance_leaves_worktrees_when_space_is_free(self):
+        tree = self.worktree('merged', 'feature/merged')
+        report = self.scheduled(maintain=False)
+        self.assertEqual(report['status'], 'no-disk-pressure')
+        self.assertTrue(tree.exists())
+
     def statuses(self, report):
         return {e['path']: e['status'] for e in report['entries'] if e['kind'] == 'worktree-retire'}
 

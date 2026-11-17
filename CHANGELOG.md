@@ -22,10 +22,15 @@ All notable changes to this project are documented here. Format loosely follows
   not admitted twice.
 - Recovery of Gradle `build` outputs in idle git checkouts.
 - Retirement of reservation records whose guardian is gone.
+- Every hour, finished linked worktrees are retired and launchd service logs over the cap are
+  emptied in place after keeping their tail, whatever the free space. Run
+  `disk-janitor reclaim --schedule` again to update an existing hourly schedule.
+- `disk-janitor space` reports worktrees by state and folder, build caches and service logs.
 
 ### Fixed
 - The command-line tool selects a Python 3.10+ interpreter instead of failing in the middle of a
   scheduled run under the system interpreter.
+- The runtime installer upgrades a release whose set of components differs from its own.
 
 ## [0.1.4] - 2026-06-25
 

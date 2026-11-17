@@ -1013,7 +1013,8 @@ def _native_remove(paths):
         subprocess.run(['/bin/rm', '-rf', '--', *pending], check=True, capture_output=True)
 
 
-def _recover_batches(home, app_home, *, apply, pressure_only, observer, report, floors=None, deadline=None):
+def _recover_batches(home, app_home, *, apply, pressure_only, observer, report, floors=None, deadline=None,
+                     maintain=False, lifecycle_only=False):
     guard = _SourceGuard(home)
     view = _activity_view(observer, home, app_home)
     demand = pressure_demand(app_home, floors) if pressure_only else None
@@ -1093,9 +1094,13 @@ def _recover_batches(home, app_home, *, apply, pressure_only, observer, report, 
         return bool(view[1].unknown) or view[1].occupied(checkout)
 
     # Finished checkouts go first: retiring one frees its build output with it.
+    # Lifecycle work is not limited to devices under pressure when the pass maintains.
+    scoped = demand if pressure_only and not maintain else None
     _retire_worktrees(home, report, note, view, lambda: _activity_view(observer, home, app_home),
-                      apply=apply, demand=demand if pressure_only else None, deadline=deadline)
-    _cap_service_logs(home, report, note, apply=apply, demand=demand if pressure_only else None)
+                      apply=apply, demand=scoped, deadline=deadline)
+    _cap_service_logs(home, report, note, apply=apply, demand=scoped)
+    if lifecycle_only:
+        return
 
     for kind, path in candidates(home, occupied, deadline):
         if deadline is not None and time.monotonic() >= deadline:
@@ -1235,7 +1240,13 @@ def pressure_demand(app_home, floors=None, home=None):
 
 
 def recover(home, app_home, *, apply=False, pressure_only=False, drain_seconds=30, observer=activity,
-            floors=None, time_limit=None):
+            floors=None, time_limit=None, maintain=False):
+    """Recover regenerable space; with maintain, also do the workspace lifecycle work.
+
+    A pressure-only pass removes caches only while a device is below its floor. maintain
+    adds what is due whatever the free space: retiring finished worktrees and capping
+    service logs. The hourly scheduled pass maintains; admission and the watchdog do not.
+    """
     home, app_home = Path(home).resolve(), Path(app_home).resolve()
     app_home.mkdir(parents=True, exist_ok=True)
     report = {'applied': apply, 'pressure_only': pressure_only, 'started_at': time.time(), 'status': 'completed',
@@ -1264,6 +1275,11 @@ def recover(home, app_home, *, apply=False, pressure_only=False, drain_seconds=3
             report['initial_demand'] = demand
             if not demand:
                 report['status'] = 'no-disk-pressure'
+                if maintain:
+                    _recover_batches(home, app_home, apply=apply, pressure_only=True, observer=observer,
+                                     report=report, floors=floors, deadline=deadline, maintain=True,
+                                     lifecycle_only=True)
+                    report['completed_at'] = time.time()
                 return report
             # Running jobs share the guard fence for their whole life, so it is neither
             # awaited nor taken here: per-unit activity proof decides what is idle, and no
@@ -1275,7 +1291,8 @@ def recover(home, app_home, *, apply=False, pressure_only=False, drain_seconds=3
                     return report
         try:
             _recover_batches(home, app_home, apply=apply, pressure_only=pressure_only,
-                             observer=observer, report=report, floors=floors, deadline=deadline)
+                             observer=observer, report=report, floors=floors, deadline=deadline,
+                             maintain=maintain)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             # Keep authoritative completed work if a later batch cannot be
             # inspected. Direct callers still receive the original error;
@@ -1383,6 +1400,8 @@ def main():
     parser.add_argument('--report', type=Path)
     parser.add_argument('--requester')
     parser.add_argument('--pressure-only', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--maintain', action='store_true',
+                        help='also retire finished worktrees and cap service logs, whatever the free space')
     parser.add_argument('--need', action='append', default=[], metavar='MOUNT=BYTES', help=argparse.SUPPRESS)
     parser.add_argument('--time-limit', type=float, help=argparse.SUPPRESS)
     parser.add_argument('--watchdog', action='store_true', help=argparse.SUPPRESS)
@@ -1413,7 +1432,7 @@ def main():
         # global fence; services and unmarked jobs remain untouched.
         preempted = request_preemption(app_home, args.requester) if args.requester else None
         result = recover(home, app_home, apply=args.apply, pressure_only=args.pressure_only,
-                         floors=floors, time_limit=args.time_limit)
+                         floors=floors, time_limit=args.time_limit, maintain=args.maintain)
         if args.requester:
             result['preemption_requested'] = preempted
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
