@@ -10,7 +10,8 @@ setup() {
   printf 'prefer-frozen-lockfile=true\n' > "$SB/.npmrc"   # pre-existing, must be restored
 }
 
-teardown() { rm -rf "$SB"; }
+# Published runtime releases are read-only; make the sandbox writable before removing it.
+teardown() { chmod -R u+w "$SB"; rm -rf "$SB"; }
 
 dj() {
   env -i HOME="$SB" PATH="$PATH" DISK_JANITOR_HOME="$SB/.dj" \
