@@ -58,6 +58,15 @@ class ServiceLogCapTests(unittest.TestCase):
         self.assertEqual(log.read_bytes(), b'next line\n')
         self.assertIn('service-log:removed', report['counts'])
 
+    def test_scheduled_maintenance_caps_logs_without_disk_pressure(self):
+        log = self.log('service.log', 40)
+        self.agent('service', StandardOutPath=str(log))
+        report = self.recovery.recover(self.home, self.app, apply=True, pressure_only=True, maintain=True,
+                                       floors={str(self.home): 0}, observer=lambda: ([], []))
+        self.assertEqual(report['status'], 'no-disk-pressure')
+        self.assertEqual(log.stat().st_size, 0)
+        self.assertIn('service-log:removed', report['counts'])
+
     def test_small_logs_unlisted_files_and_previews_are_left_alone(self):
         small = self.log('small.log', 1)
         self.agent('small', StandardErrorPath=str(small))

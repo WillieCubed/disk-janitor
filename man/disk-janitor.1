@@ -193,7 +193,8 @@ credentials, databases, active outputs, disk images and unique artifacts
 remain
 protected. No manually approved path list is required for these categories.
 .PP
-Every recovery pass also retires finished linked worktrees of the repositories
+The hourly pass, whatever the free space, and any pass under pressure also
+retire finished linked worktrees of the repositories
 under the project directories, wherever a tool created them. Work is finished
 when the worktree's HEAD is in the remote default branch, its branch was
 deleted upstream, or its combined change was squash-merged. A worktree is kept
@@ -204,7 +205,7 @@ Removal uses
 .B git worktree remove
 after the same checks are repeated, and the branch stays in the repository.
 .PP
-Each pass also caps the output files named by the user's launchd agents
+The same passes cap the output files named by the user's launchd agents
 (StandardOutPath and StandardErrorPath), which launchd appends to without
 rotation. A file over the cap keeps its last 8 MiB in
 .I file.1

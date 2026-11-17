@@ -1307,7 +1307,8 @@ from pathlib import Path
 path, binary, home = sys.argv[1:]
 with Path(path).open('wb') as stream:
     plistlib.dump(dict(Label='disk-janitor-reclaim',
-        ProgramArguments=[binary, 'reclaim', '--apply', '--pressure-only', '--report', home + '/reclaim-last.json'],
+        ProgramArguments=[binary, 'reclaim', '--apply', '--pressure-only', '--maintain',
+                          '--report', home + '/reclaim-last.json'],
         StartInterval=3600, ProcessType='Background', LowPriorityIO=True,
         StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
 # Every minute: retire dead registry records and restore free space to the low-water
