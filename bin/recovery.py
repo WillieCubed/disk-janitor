@@ -404,6 +404,159 @@ def _checkout_of(path):
     raise ValueError('build output is outside a checkout')
 
 
+RETIRE_IDLE_SECONDS = 48 * 3600
+
+
+def _git_text(directory, *arguments):
+    result = _git(directory, *arguments)
+    return os.fsdecode(result.stdout).strip() if result.returncode == 0 else None
+
+
+def _linked_git_dir(checkout):
+    """The private git directory of a linked worktree; None for a main checkout or submodule."""
+    marker = checkout / '.git'
+    if not _plain(marker):
+        return None
+    text = marker.read_text(errors='replace').strip()
+    if not text.startswith('gitdir: '):
+        return None
+    git_dir = Path(text[8:])
+    if not git_dir.is_absolute():
+        git_dir = (checkout / git_dir).resolve()
+    if git_dir.parent.name != 'worktrees' or not _plain(git_dir, True):
+        return None
+    return git_dir
+
+
+def _default_branch(checkout):
+    head = _git_text(checkout, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')
+    if head:
+        return head
+    for name in ('refs/remotes/origin/main', 'refs/remotes/origin/master'):
+        if _git(checkout, 'rev-parse', '--verify', '--quiet', name).returncode == 0:
+            return name
+    return None
+
+
+def retirement(checkout, now=None):
+    """Why a linked worktree's work is finished, or raise ValueError saying why it is kept.
+
+    Finished means every commit stays reachable after the checkout goes: its HEAD is in
+    the remote default branch, or its branch was deleted upstream (a merged pull request)
+    and the local branch keeps the commits. The checkout must also be clean, unlocked and
+    untouched for RETIRE_IDLE_SECONDS, so a worktree just created from main is not mistaken
+    for finished work.
+    """
+    git_dir = _linked_git_dir(checkout)
+    if git_dir is None:
+        raise ValueError('not a linked worktree')
+    if os.path.lexists(git_dir / 'locked'):
+        raise ValueError('locked with git worktree lock')
+    status = _git(checkout, 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
+    if status.returncode:
+        raise RuntimeError('cannot establish source state')
+    if status.stdout.strip():
+        raise ValueError('uncommitted work preserved')
+    times = [p.stat().st_mtime for p in (git_dir / 'HEAD', git_dir / 'index', git_dir / 'logs/HEAD')
+             if os.path.lexists(p)]
+    committed = _git_text(checkout, 'log', '-1', '--format=%ct')
+    if committed:
+        times.append(float(committed))
+    if not times or (now or time.time()) - max(times) < RETIRE_IDLE_SECONDS:
+        raise ValueError('recently active')
+    head = _git_text(checkout, 'rev-parse', '--verify', 'HEAD')
+    if not head:
+        raise RuntimeError('cannot read HEAD')
+    default = _default_branch(checkout)
+    if default and _git(checkout, 'merge-base', '--is-ancestor', head, default).returncode == 0:
+        return head, 'merged into ' + default.removeprefix('refs/remotes/')
+    branch = _git_text(checkout, 'symbolic-ref', '--quiet', 'HEAD')
+    if branch and _git_text(checkout, 'for-each-ref', '--format=%(upstream:track)', branch) == '[gone]':
+        return head, 'branch deleted upstream; kept locally as ' + branch.removeprefix('refs/heads/')
+    if default and branch and _squash_merged(checkout, head, default):
+        return head, 'squash-merged into ' + default.removeprefix('refs/remotes/') + '; kept locally as ' + \
+            branch.removeprefix('refs/heads/')
+    raise ValueError('work not merged')
+
+
+def _squash_merged(checkout, head, default):
+    """Whether the branch's combined change already landed in default as one commit.
+
+    A squash merge leaves none of the branch's commits in default, so the whole change is
+    folded into one probe commit on the merge base and git cherry looks for a commit in
+    default with the same patch.
+    """
+    base = _git_text(checkout, 'merge-base', default, head)
+    if not base or base == head:
+        return False
+    probe = _git_text(checkout, 'commit-tree', head + '^{tree}', '-p', base, '-m', 'disk-janitor squash probe')
+    if not probe:
+        return False
+    cherry = _git_text(checkout, 'cherry', default, probe)
+    return bool(cherry) and cherry.startswith('-')
+
+
+def _main_checkout(checkout):
+    common = _git_text(checkout, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    if not common:
+        raise RuntimeError('cannot find the main checkout')
+    return Path(common).parent
+
+
+def _allocated(path, deadline=None):
+    total = 0
+    for directory, names, files in os.walk(path, followlinks=False):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        for name in names + files:
+            try:
+                total += os.lstat(os.path.join(directory, name)).st_blocks * 512
+            except OSError:
+                continue
+    return total
+
+
+def _retire_worktrees(home, report, note, view, view_now, *, apply, demand=None, deadline=None):
+    """Remove clean, idle linked worktrees whose work is finished, with git, keeping every branch.
+
+    view is the pass's activity observation; view_now observes again just before a removal.
+    """
+    if view[1].unknown:
+        return
+    for checkout in worktrees(home):
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        if _linked_git_dir(checkout) is None:
+            continue
+        entry = dict(kind='worktree-retire', path=str(checkout), allocated_bytes=0)
+        try:
+            if demand is not None and checkout.stat().st_dev not in demand:
+                continue
+            if view[1].occupied(checkout):
+                note(entry, 'active'); continue
+            head, reason = retirement(checkout)
+            entry['finished'] = reason
+            entry['allocated_bytes'] = _allocated(checkout, deadline)
+            if not apply:
+                note(entry, 'eligible'); continue
+            # Prove it again at the moment of removal: occupancy, cleanliness and HEAD.
+            fresh = view_now()
+            if fresh[1].unknown or fresh[1].occupied(checkout):
+                note(entry, 'active'); continue
+            if retirement(checkout)[0] != head:
+                note(entry, 'changed'); continue
+            removal = _git(_main_checkout(checkout), 'worktree', 'remove', str(checkout))
+            if removal.returncode or os.path.lexists(checkout):
+                note(entry, 'preserved', os.fsdecode(removal.stderr).strip() or 'git kept the worktree'); continue
+            note(entry, 'removed')
+            report['removed_allocated_bytes'] += entry['allocated_bytes']
+        except ValueError as kept:
+            report['worktrees_kept'] = report.get('worktrees_kept', 0) + 1
+            entry['reason'] = str(kept)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            note(entry, 'preserved', error)
+
+
 def candidates(home, occupied=None, deadline=None):
     # Outputs of checkouts nobody occupies go first: shared caches still serve active work.
     for discover in (lambda root: _worktree_candidates(root, occupied, deadline),
@@ -771,6 +924,10 @@ def _recover_batches(home, app_home, *, apply, pressure_only, observer, report, 
 
     def occupied(checkout):
         return bool(view[1].unknown) or view[1].occupied(checkout)
+
+    # Finished checkouts go first: retiring one frees its build output with it.
+    _retire_worktrees(home, report, note, view, lambda: _activity_view(observer, home, app_home),
+                      apply=apply, demand=demand if pressure_only else None, deadline=deadline)
 
     for kind, path in candidates(home, occupied, deadline):
         if deadline is not None and time.monotonic() >= deadline:
