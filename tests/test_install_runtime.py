@@ -181,6 +181,46 @@ class AtomicRuntimeInstall(unittest.TestCase):
             if name != 'disk-janitor':
                 self.assertEqual((self.home / name).read_bytes(), (first / name).read_bytes())
 
+    def load_installer(self):
+        spec = importlib.util.spec_from_file_location('install_runtime_under_test', INSTALLER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_upgrade_across_changed_components_retires_dropped_aliases(self):
+        retired = 'retired_helper.py'
+        (self.source / retired).write_text('# helper the next release drops\n')
+        module = self.load_installer()
+        with mock.patch.object(module, 'COMPONENTS', module.COMPONENTS + (retired,)):
+            first = module.publish(self.source, self.home)
+        self.assertEqual(os.readlink(self.home / retired), 'current/' + retired)
+        (self.source / retired).unlink()
+        self.write_source('two')
+        second = self.install()
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.run_canonical(), 'two')
+        self.assertFalse((self.home / retired).is_symlink())
+        self.assertTrue((first / retired).is_file())
+        for name in NAMES:
+            if name != 'disk-janitor':
+                self.assertEqual(os.readlink(self.home / name), 'current/' + name)
+
+    def test_current_release_with_unsafe_component_name_is_rejected(self):
+        first = self.install()
+        manifest = json.loads((first / 'manifest.json').read_text())
+        manifest['components']['../escape'] = manifest['components']['jobs.py']
+        forged = self.home / 'releases' / self.load_installer().release_id(manifest['components'])
+        forged.mkdir()
+        (forged / 'manifest.json').write_text(json.dumps(manifest))
+        forged.chmod(0o555)
+        (self.home / 'current').unlink()
+        (self.home / 'current').symlink_to('releases/' + forged.name)
+        self.write_source('two')
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('manifest', result.stderr)
+        self.assertEqual((self.home / 'current').resolve(), forged)
+
 
 if __name__ == '__main__':
     unittest.main()
