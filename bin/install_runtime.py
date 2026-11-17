@@ -16,6 +16,7 @@ import uuid
 
 COMPONENTS = ('disk-janitor', 'recovery.py', 'jobs.py', 'capacity.py', 'coverage.py',
               'commitments.py', 'install_runtime.py')
+COMPONENT_NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}')
 
 
 def sync_dir(path):
@@ -114,7 +115,7 @@ def verify_release_directory(path):
 
 def verify_release(path, entries):
     verify_release_directory(path)
-    if set(p.name for p in path.iterdir()) != set(COMPONENTS) | {'manifest.json'}:
+    if set(p.name for p in path.iterdir()) != set(entries) | {'manifest.json'}:
         raise ValueError('unexpected file in immutable runtime release')
     manifest, mode = read_file(path / 'manifest.json')
     if mode != 0o444 or json.loads(manifest) != {'version': 1, 'components': entries}:
@@ -171,9 +172,12 @@ def validate_current(home):
     verify_release_directory(release)
     manifest, _ = read_file(release / 'manifest.json')
     payload = json.loads(manifest)
-    if payload.get('version') != 1 or set(payload.get('components', {})) != set(COMPONENTS):
+    # The current release may come from an older version with a different
+    # component set; it is verified against its own manifest.
+    entries = payload.get('components') if isinstance(payload, dict) else None
+    if (not isinstance(entries, dict) or payload.get('version') != 1 or 'disk-janitor' not in entries
+            or any(not isinstance(name, str) or not COMPONENT_NAME.fullmatch(name) for name in entries)):
         raise ValueError('invalid current runtime manifest')
-    entries = payload['components']
     if release.name != release_id(entries):
         raise ValueError('current runtime digest mismatch')
     verify_release(release, entries)
@@ -246,7 +250,24 @@ def publish(source, home):
                 replace_link(alias, 'current/' + name)
         publish_launcher(home)
         replace_link(home / 'current', 'releases/' + candidate.name)
+        if previous is not None:
+            retire_dropped_aliases(home, previous)
         return candidate
+
+
+def retire_dropped_aliases(home, previous):
+    # Aliases of components the active release no longer ships would dangle.
+    # Only the installer's own alias form is removed.
+    names = json.loads(read_file(previous / 'manifest.json')[0])['components']
+    removed = False
+    for name in set(names) - set(COMPONENTS):
+        alias = home / name
+        if (alias.is_symlink() and alias.lstat().st_uid == os.getuid()
+                and os.readlink(alias) == 'current/' + name):
+            alias.unlink()
+            removed = True
+    if removed:
+        sync_dir(home)
 
 
 def main():
