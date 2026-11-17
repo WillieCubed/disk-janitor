@@ -133,14 +133,18 @@ agents_block() {
   output locations. Source, uncommitted work, credentials, databases and active output
   are preserved; automatic reclamation is limited to the authorized inactive Cargo
   incremental and proven generated dependency objects, Gradle task/transform build
-  caches and Xcode DerivedData categories.
+  caches, Xcode DerivedData, finished linked worktrees and the oversized output
+  files of launchd agents.
 - Work an external broker started (DISK_JANITOR_BROKER is set) stays in that broker;
   do not nest another reservation.
   Commands execute in the submitting permission context. Platform approvals and
   explicit denials still apply; this tool is not an approval bypass.
 - Shared Cargo output remains \`$TARGET_DIR\`; do not override CARGO_TARGET_DIR.
   pnpm remains configured for shared-store cloning; never copy target/node_modules.
-  Retire merged or abandoned source worktrees only after source/process review.
+  A linked worktree is retired automatically once its work is merged, squash-merged
+  or its branch is deleted upstream, and it has been clean and idle for 48 hours;
+  its branch is kept. Commit or discard finished work so its worktree can retire,
+  and run \`git worktree lock PATH\` to keep one. \`disk-janitor space\` shows the state.
 EOF
   printf '%s\n' '<!-- /disk-janitor:worktrees -->'
 }
@@ -1881,6 +1885,7 @@ $APP_NAME v$APP_VERSION — submit work; scheduling and recovery are automatic.
   $APP_NAME logs JOB [-f]           read or follow retained diagnostic output
   $APP_NAME wait JOB                wait; return the command's exit status
   $APP_NAME cancel JOB              request cancellation of your job
+  $APP_NAME space [--json]          show where disk space goes; changes nothing
 
 No resource options or manual cleanup approvals are needed for ordinary jobs.
 Each submission is distinct. Inspect status after a lost receipt; do not blindly resubmit.
@@ -1904,6 +1909,7 @@ case "${1:-help}" in
   _coverage) shift; cmd_coverage "$@" ;;
   submit|wait|cancel|jobs|show) command="$1"; shift; cmd_jobs "$command" "$@" ;;
   status)    shift; cmd_jobs status "$@" ;;
+  space)     shift; cmd_recover --space "$@" ;;
   logs)
     case "${2:-}" in
       j-*) shift; cmd_jobs logs "$@" ;;
