@@ -1305,18 +1305,20 @@ cmd_reclaim_schedule() {
 import plistlib, sys
 from pathlib import Path
 path, binary, home = sys.argv[1:]
+# Not Background: that QoS with low-priority IO stretches a 10 ms git status past its
+# timeout, so a pass inspects nothing. Nice keeps the passes polite to interactive work.
 with Path(path).open('wb') as stream:
     plistlib.dump(dict(Label='disk-janitor-reclaim',
         ProgramArguments=[binary, 'reclaim', '--apply', '--pressure-only', '--maintain',
                           '--report', home + '/reclaim-last.json'],
-        StartInterval=3600, ProcessType='Background', LowPriorityIO=True,
+        StartInterval=3600, ProcessType='Standard', Nice=10,
         StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
 # Every minute: retire dead registry records and restore free space to the low-water
 # mark, so a starting job rarely meets its floor. It takes no lock a job waits on.
 with Path(path).with_name('disk-janitor-watchdog.plist').open('wb') as stream:
     plistlib.dump(dict(Label='disk-janitor-watchdog',
         ProgramArguments=[binary, 'recover', '--watchdog'],
-        StartInterval=60, ProcessType='Background', LowPriorityIO=True,
+        StartInterval=60, ProcessType='Standard', Nice=10,
         StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
 PY
   if [ -z "$NO_SCHED" ]; then

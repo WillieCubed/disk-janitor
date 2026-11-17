@@ -31,6 +31,8 @@ All notable changes to this project are documented here. Format loosely follows
 - The command-line tool selects a Python 3.10+ interpreter instead of failing in the middle of a
   scheduled run under the system interpreter.
 - The runtime installer upgrades a release whose set of components differs from its own.
+- The hourly pass and the watchdog no longer run as launchd Background jobs with low-priority IO,
+  which stretched each git inspection past its timeout so a pass examined nothing.
 
 ## [0.1.4] - 2026-06-25
 
