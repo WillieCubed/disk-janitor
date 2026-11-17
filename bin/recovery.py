@@ -324,9 +324,9 @@ GRADLE_SCRIPTS = frozenset({'build.gradle', 'build.gradle.kts', 'settings.gradle
 PRIVACY_GATED = frozenset({'Documents', 'Desktop', 'Downloads', 'Library'})
 
 
-def _git(directory, *arguments):
+def _git(directory, *arguments, timeout=10):
     return subprocess.run(['git', '--literal-pathspecs', '-c', 'core.fsmonitor=false', '-C', str(directory), *arguments],
-                          capture_output=True, timeout=10, env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
+                          capture_output=True, timeout=timeout, env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
 
 
 def _project_roots(home):
@@ -553,7 +553,8 @@ def _retire_worktrees(home, report, note, view, view_now, *, apply, demand=None,
                 note(entry, 'active'); continue
             if retirement(checkout)[0] != head:
                 note(entry, 'changed'); continue
-            removal = _git(_main_checkout(checkout), 'worktree', 'remove', str(checkout))
+            # No timeout: a removal killed partway leaves a half-deleted checkout that looks dirty.
+            removal = _git(_main_checkout(checkout), 'worktree', 'remove', str(checkout), timeout=None)
             if removal.returncode or os.path.lexists(checkout):
                 note(entry, 'preserved', os.fsdecode(removal.stderr).strip() or 'git kept the worktree'); continue
             note(entry, 'removed')

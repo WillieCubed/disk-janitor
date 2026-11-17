@@ -33,6 +33,8 @@ All notable changes to this project are documented here. Format loosely follows
 - The runtime installer upgrades a release whose set of components differs from its own.
 - The hourly pass and the watchdog no longer run as launchd Background jobs with low-priority IO,
   which stretched each git inspection past its timeout so a pass examined nothing.
+- Removing a finished worktree is no longer cut short by the 10-second git timeout, which left a
+  large checkout half-deleted.
 
 ## [0.1.4] - 2026-06-25
 

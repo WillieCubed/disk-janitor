@@ -86,6 +86,19 @@ class WorktreeRetirementTests(unittest.TestCase):
         self.assertFalse(tree.exists())
         run(self.repo, 'git', 'rev-parse', '--verify', 'refs/heads/feature/merged')
 
+    def test_removal_is_never_cut_short_by_a_timeout(self):
+        # Killing git worktree remove partway leaves a half-deleted checkout that looks dirty.
+        tree = self.worktree('merged', 'feature/merged')
+        calls, original = [], self.recovery._git
+        def recording(directory, *arguments, **options):
+            calls.append((arguments, options))
+            return original(directory, *arguments, **options)
+        self.recovery._git = recording
+        self.recover()
+        removals = [options for arguments, options in calls if arguments[:2] == ('worktree', 'remove')]
+        self.assertEqual(removals, [{'timeout': None}])
+        self.assertFalse(tree.exists())
+
     def test_preview_retires_nothing(self):
         tree = self.worktree('preview', 'feature/preview')
         report = self.recover(apply=False)
