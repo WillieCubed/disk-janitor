@@ -2,14 +2,9 @@
 # Bootstrap installer: copy the CLI onto your PATH and run `disk-janitor install`.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-dest="$HOME/.local/bin"
-mkdir -p "$dest"
-install -m 0755 "$here/bin/disk-janitor" "$dest/disk-janitor"
-echo "Installed $dest/disk-janitor"
-case ":$PATH:" in
-  *":$dest:"*) ;;
-  *) echo "NOTE: $dest is not on your PATH. Add it, e.g.:  export PATH=\"$dest:\$PATH\"" ;;
-esac
+# Install the complete runtime through its atomic publisher before exposing the
+# canonical command. Never copy individual live helper modules here.
+"$here/bin/disk-janitor" install "$@"
 
 # Best-effort: man page + shell completions (Homebrew handles these automatically).
 share="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -19,4 +14,3 @@ mkdir -p "$share/zsh/site-functions"          && install -m 0644 "$here/completi
 mkdir -p "$HOME/.config/fish/completions"      && install -m 0644 "$here/completions/disk-janitor.fish" "$HOME/.config/fish/completions/disk-janitor.fish" 2>/dev/null
 echo "Installed shell completions (bash/zsh/fish)"
 
-exec "$dest/disk-janitor" install "$@"

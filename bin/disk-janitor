@@ -13,7 +13,7 @@
 set -uo pipefail
 
 APP_NAME="disk-janitor"
-APP_VERSION="0.1.4"
+APP_VERSION="0.3.0-lifecycle"
 APP_HOME="${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"
 STATE_DIR="$APP_HOME/state"
 CONFIG_FILE="$APP_HOME/config.env"
@@ -38,8 +38,6 @@ GIT_REPOS=()                                  # empty = auto-discover under PROJ
 DATA_PATH="$DATA_PATH_DEFAULT"                # filesystem to report free space for
 NPM_IMPORT_METHOD="$NPM_IMPORT_DEFAULT"       # pnpm package-import-method
 SWEEP_DAYS=10                                 # cargo artifacts older than this are swept
-NM_DAYS=30                                    # node_modules untouched this long are removed
-WORKTREE_DAYS=14                              # agent worktree checkouts idle this long are removed
 RUN_WEEKDAY=0                                 # 0=Sunday
 RUN_HOUR=3
 RUN_MINUTE=0
@@ -47,6 +45,13 @@ AGENT_GUIDANCE=0                              # 1 = manage worktree guidance in 
 AGENT_GUIDANCE_FILES=("$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md")
 # shellcheck source=/dev/null
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Optional capacity policy from the config file reaches the runtime as environment.
+[ -z "${FLOOR_GIB:-}" ] || export DISK_JANITOR_FLOOR_GIB="$FLOOR_GIB"
+[ -z "${MAX_RUNNING:-}" ] || export DISK_JANITOR_MAX_RUNNING="$MAX_RUNNING"
+[ -z "${LOW_WATER_GIB:-}" ] || export DISK_JANITOR_LOW_WATER_GIB="$LOW_WATER_GIB"
+# Checkouts of the repositories under these roots have their idle build outputs recovered.
+DISK_JANITOR_PROJECT_DIRS="$(IFS=:; printf '%s' "${PROJECT_DIRS[*]}")"; export DISK_JANITOR_PROJECT_DIRS
 
 # env hooks (used by tests / CI; not for normal use)
 NO_SCHED="${DISK_JANITOR_NO_SCHED:-}"         # skip launchctl/systemctl/crontab activation
@@ -61,6 +66,24 @@ say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s\n' "${c_grn}✓${c_0} $*"; }
 warn() { printf '%s\n' "${c_yel}!${c_0} $*"; }
 err()  { printf '%s\n' "${c_red}✗${c_0} $*" >&2; }
+# The runtime needs Python 3.10+. A scheduler's minimal PATH finds the older system
+# interpreter first, so choose one explicitly instead of failing in the middle of a run.
+PYTHON=""
+find_python() {
+  [ -z "$PYTHON" ] || return 0
+  local candidate found
+  for candidate in ${DISK_JANITOR_PYTHON:+"$DISK_JANITOR_PYTHON"} python3 \
+      /Library/Frameworks/Python.framework/Versions/Current/bin/python3 /opt/homebrew/bin/python3 \
+      /usr/local/bin/python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+    found="$(type -P "$candidate" 2>/dev/null)" || continue  # a path, never the function below
+    if "$found" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' 2>/dev/null; then
+      PYTHON="$found"; return 0
+    fi
+  done
+  err "Python 3.10 or newer is required and none was found; set DISK_JANITOR_PYTHON to one"
+  return 2
+}
+python3() { find_python || return $?; command "$PYTHON" "$@"; }
 free_space() { df -Ph "$DATA_PATH" 2>/dev/null | awk 'NR==2 {print $4}'; }
 human() { du -sh "$1" 2>/dev/null | awk '{print $1}'; }
 tilde() { case "$1" in "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}";; *) printf '%s\n' "$1";; esac; }
@@ -94,19 +117,34 @@ restore_file() { # path key
 agents_block() {
   cat <<EOF
 <!-- $APP_NAME:worktrees -->
-# Worktrees & build artifacts
+# Submit work; the tool owns resource management
 
-A shared Cargo target dir (\`$TARGET_DIR\`, in \`~/.cargo/config.toml\`) and pnpm
-linking (\`package-import-method=$NPM_IMPORT_METHOD\` in \`~/.npmrc\`) are configured globally so build
-artifacts are not duplicated across git worktrees.
-
-- Do **not** override \`CARGO_TARGET_DIR\` or set a per-worktree \`target-dir\`.
-- Do **not** change \`package-import-method\`; \`pnpm install\` should link from the shared store.
-- When a worktree's branch is merged or abandoned, \`git worktree remove <path>\` (then \`git worktree prune\`).
-- Never copy \`node_modules\`/\`target\` between worktrees.
-<!-- /$APP_NAME:worktrees -->
+- Submit build, test and local validation workflows with \`disk-janitor submit -- COMMAND\`.
+  It returns a job ID immediately. Use \`disk-janitor wait JOB\`, \`status JOB\`,
+  \`logs JOB\` (or \`logs JOB -f\`) and \`cancel JOB\` for jobs you own.
+- Do not choose disk budgets, scheduling classes, reserve exceptions, storage roots
+  or restart policy. Do not edit queue records, locks, receipts or private policy.
+  Accepted work stays queued and resumes automatically; acceptance is not completion.
+- Every submission is a new invocation, even for identical commands. When a submit
+  result is uncertain, inspect \`disk-janitor status\` before submitting again.
+  Unknown execution outcomes are never automatically replayed.
+- Keep the workflow's children in its managed process group. Do not launch untracked
+  writers. Retain unique artifacts in \`DISK_JANITOR_ARTIFACT_ROOT\` or source-owned
+  output locations. Source, uncommitted work, credentials, databases and active output
+  are preserved; automatic reclamation is limited to the authorized inactive Cargo
+  incremental and proven generated dependency objects, Gradle task/transform build
+  caches and Xcode DerivedData categories.
+- Work an external broker started (DISK_JANITOR_BROKER is set) stays in that broker;
+  do not nest another reservation.
+  Commands execute in the submitting permission context. Platform approvals and
+  explicit denials still apply; this tool is not an approval bypass.
+- Shared Cargo output remains \`$TARGET_DIR\`; do not override CARGO_TARGET_DIR.
+  pnpm remains configured for shared-store cloning; never copy target/node_modules.
+  Retire merged or abandoned source worktrees only after source/process review.
 EOF
+  printf '%s\n' '<!-- /disk-janitor:worktrees -->'
 }
+
 strip_agents_block() { # file -> stdout
   awk -v a="<!-- $APP_NAME:worktrees -->" -v b="<!-- /$APP_NAME:worktrees -->" '
     $0 ~ a {skip=1} skip==0 {print} $0 ~ b {skip=0}' "$1"
@@ -201,6 +239,11 @@ EOF
   esac
 }
 sched_uninstall() {
+  local reclaim_plist="$HOME/Library/LaunchAgents/$APP_NAME-reclaim.plist"
+  if [ "$OS" = Darwin ] && [ -f "$reclaim_plist" ]; then
+    [ -n "$NO_SCHED" ] || launchctl unload "$reclaim_plist" 2>/dev/null || true
+    rm -f "$reclaim_plist"
+  fi
   local kind; kind="$(cat "$STATE_DIR/scheduler" 2>/dev/null || sched_kind)"
   case "$kind" in
     launchd) [ -n "$NO_SCHED" ] || launchctl unload "$PLIST" 2>/dev/null; rm -f "$PLIST" ;;
@@ -238,8 +281,6 @@ write_default_config() {
     echo "DATA_PATH=\"$DATA_PATH\""
     echo "NPM_IMPORT_METHOD=\"$NPM_IMPORT_METHOD\""
     echo "SWEEP_DAYS=$SWEEP_DAYS"
-    echo "NM_DAYS=$NM_DAYS"
-    echo "WORKTREE_DAYS=$WORKTREE_DAYS"
     echo "RUN_WEEKDAY=$RUN_WEEKDAY   # 0=Sunday"
     echo "RUN_HOUR=$RUN_HOUR"
     echo "RUN_MINUTE=$RUN_MINUTE"
@@ -276,12 +317,9 @@ cmd_install() {
   guard_paths
 
   mkdir -p "$APP_HOME" "$STATE_DIR" "$(dirname "$BIN_LINK")" "$(dirname "$LOG")" "$TARGET_DIR"
-  local here; here="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  if [ "$here" != "$SELF_CANONICAL" ]; then
-    rm -f "$SELF_CANONICAL"   # old copy may be read-only (e.g. from a Homebrew Cellar source); cp can't overwrite it
-    cp "$0" "$SELF_CANONICAL"
-  fi
-  chmod u+wx "$SELF_CANONICAL"; ln -sf "$SELF_CANONICAL" "$BIN_LINK"
+  local runtime_source; runtime_source="$(runtime_directory)" || return $?
+  python3 -B "$runtime_source/install_runtime.py" --source "$runtime_source" --home "$APP_HOME" >/dev/null || return $?
+  ln -sf "$SELF_CANONICAL" "$BIN_LINK"
   write_default_config
   # persist the guidance choice
   grep -q '^AGENT_GUIDANCE=' "$CONFIG_FILE" 2>/dev/null \
@@ -307,12 +345,17 @@ package-import-method=$NPM_IMPORT_METHOD" npmrc
   ensure_agents_block
   [ "$AGENT_GUIDANCE" = 1 ] || say "${c_dim}(agent guidance off — enable with 'install --with-agent-guidance')${c_0}"
 
+  python3 -B "$APP_HOME/coverage.py" install-shell || return $?
+
   sched_install
   echo; ok "${c_bold}$APP_NAME installed.${c_0}  Try '$APP_NAME status' or '$APP_NAME run --dry-run'."
 }
 
 cmd_uninstall() {
   local purge="${1:-}"
+  if [ -f "$APP_HOME/coverage.py" ]; then
+    python3 -B "$APP_HOME/coverage.py" uninstall-shell || return $?
+  fi
   sched_uninstall
   restore_file "$HOME/.cargo/config.toml" cargo-config; ok "~/.cargo/config.toml reverted"
   restore_file "$HOME/.npmrc" npmrc; ok "~/.npmrc reverted"
@@ -328,6 +371,1409 @@ cmd_uninstall() {
   ok "${c_bold}$APP_NAME uninstalled.${c_0}"
 }
 
+cmd_capacity() {
+  find_python || return $?
+  DISK_JANITOR_RUNTIME_DIR="$(runtime_directory)" exec "$PYTHON" -B - "$DATA_PATH" "$APP_HOME" "$@" 9<&0 <<'PY'
+import argparse, fcntl, hashlib, json, math, os, re, selectors, signal, stat, subprocess, sys, time, uuid
+from contextlib import contextmanager
+from pathlib import Path
+import shutil
+sys.path.insert(0, os.environ.get('DISK_JANITOR_RUNTIME_DIR', str(Path(app_home) if 'app_home' in globals() else Path.cwd() / 'bin')))
+
+data_path, app_home, mode = sys.argv[1:4]
+p = argparse.ArgumentParser(description='Immediate admission above a free-space floor, monitoring, and recovery of authorized inactive caches.')
+def configured_floor():
+    try: return float(os.environ.get('DISK_JANITOR_FLOOR_GIB', 5))
+    except ValueError: return 5
+p.add_argument('--root-reserve-gib', type=float, default=configured_floor(), help='free-space floor (DISK_JANITOR_FLOOR_GIB, default 5): below it one bounded recovery runs, then the job starts or fails')
+p.add_argument('--warn-free-gib', type=float, default=100, help='early headroom warning only; 0 disables it without changing admission')
+p.add_argument('--planned-gib', type=float, default=6)
+p.add_argument('--max-growth-gib', type=float, default=6)
+p.add_argument('--max-retained-gib', type=float, default=32, help='historical allocated-storage warning threshold only; never an admission ceiling')
+p.add_argument('--volume', action='append', nargs=2, default=[], metavar=('MOUNT', 'RESERVE_GIB'))
+p.add_argument('--write-budget', action='append', nargs=2, default=[], metavar=('MOUNT', 'GIB'), help='expected incremental writes on one required filesystem; unspecified filesystems retain --planned-gib')
+p.add_argument('--artifact-root', type=Path)
+p.add_argument('--retention-root', type=Path)
+p.add_argument('--owner')
+p.add_argument('--wait-seconds', type=float, help='progress/retry window; guard work stays queued unless --once or an explicit deadline is supplied')
+p.add_argument('--deadline-seconds', type=float)
+p.add_argument('--once', action='store_true', help='probe admission once rather than accepting queued work')
+p.add_argument('--job-id', help='stable identity for safe reattachment, not a command replay')
+p.add_argument('--foreground-stdio', action='store_true', help=argparse.SUPPRESS)
+p.add_argument('--quiet', action='store_true', help=argparse.SUPPRESS)
+p.add_argument('--submitted-at', type=float, help=argparse.SUPPRESS)
+p.add_argument('--job-control-file', type=Path, help=argparse.SUPPRESS)
+p.add_argument('--job-log-file', type=Path, help=argparse.SUPPRESS)
+p.add_argument('--work-class', choices=['feedback','build','service'], default='feedback')
+p.add_argument('--restartable', action='store_true', help='allow bounded cooperative restart of a disposable job')
+p.add_argument('--restart-kind', choices=['build','test','preview'], help='required disposable workflow declaration for --restartable; never deployments or migrations')
+p.add_argument('--recovery-after-seconds', type=float, default=30, help='minimum spacing between automatic recovery attempts')
+p.add_argument('--memory-gib', type=float, default=0, help='optional measured peak memory commitment')
+p.add_argument('--light', action='store_true', help=argparse.SUPPRESS)
+p.add_argument('--reclaim-seconds', type=float, default=2.5, help=argparse.SUPPRESS)
+p.add_argument('--lock-seconds', type=float, default=1, help=argparse.SUPPRESS)
+p.add_argument('--max-running', type=int, default=0, help=argparse.SUPPRESS)
+p.add_argument('--max-queue-seconds', type=float, default=3600, help='a job still waiting for a slot after this long fails instead of waiting indefinitely')
+p.add_argument('command', nargs=argparse.REMAINDER)
+a = p.parse_args(sys.argv[4:])
+if a.wait_seconds is None:a.wait_seconds=0 if mode=='admit' else 300
+child = None
+runtime_enabled = False
+lock = None
+marker = None
+identity = None
+retention_identity = None
+warnings = []
+headroom_notices = set()
+reservation = None
+slot = None
+record = None
+registry = None
+result_file = None
+last_reason = None
+last_notice = 0
+job_started = time.monotonic()
+
+class CapacityUnavailable(RuntimeError):
+    pass
+
+class Refused(CapacityUnavailable):
+    """The job cannot start now. It fails with this reason; it is never left queued."""
+
+def lock_within(handle, operation, seconds=None):
+    # Never queue behind a holder: take the lock within a bound or do without it.
+    end = time.monotonic() + (a.lock_seconds if seconds is None else seconds)
+    while True:
+        try:
+            fcntl.flock(handle, operation | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= end:
+                return False
+            time.sleep(.01)
+
+def notice(message):
+    # State that was ignored for admission is recorded, never silently dropped.
+    if not a.quiet: print('Admission notice: ' + message, file=sys.stderr, flush=True)
+    try:
+        path = Path(app_home) / 'admission-notices.log'
+        if path.is_symlink(): return
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'a') as output:
+            output.write(json.dumps(dict(at=time.time(), owner=a.owner, job=a.job_id, notice=message)) + '\n')
+    except OSError:
+        pass
+
+# Preserve the installed shared-pool contract for future callers. This changes
+# neither ceilings nor existing reservations; explicit approved ceilings remain
+# separate from the required common accounting scope.
+def require_shared_retention_scope(artifact, aggregate):
+    shared = Path('/Volumes/WillieDrive/CodexScratch').resolve()
+    if artifact.resolve().is_relative_to(shared) and aggregate.resolve() != shared:
+        raise RuntimeError('shared artifact pool requires --retention-root ' + str(shared) + '; private subtree quotas do not share its budget')
+
+deadline = (time.monotonic() + a.deadline_seconds if a.deadline_seconds is not None else
+            time.monotonic() + a.wait_seconds if mode == 'admit' else float('inf'))
+
+class Cancelled(RuntimeError):
+    pass
+
+signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(Cancelled('owned job cancelled')))
+signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(Cancelled('owned job cancelled')))
+
+def durable_result(path, payload):
+    temporary=path.with_name(path.name+'.receipt-'+os.urandom(8).hex())
+    descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(descriptor,'w') as output:
+        json.dump(payload,output);output.flush();os.fsync(output.fileno())
+    os.replace(temporary,path)
+    descriptor=os.open(path.parent,os.O_RDONLY)
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+def private_file(path, private_parent=True):
+    if (not path.is_absolute() or path.resolve(strict=True) != path
+            or path.parent.stat().st_uid != os.getuid()
+            or (private_parent and path.parent.stat().st_mode & 0o077)):
+        raise RuntimeError('job control requires a private canonical owned directory')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(descriptor)
+        raise RuntimeError('job control requires a private owned ordinary file')
+    return os.fdopen(descriptor)
+
+@contextmanager
+def control_decision(require_accepted=False, mark_running=False):
+    # Public cancellation and process launch share this exact lock. JSON is
+    # atomically replaced by the frontend; no persisted PID authorizes signals.
+    if not a.job_control_file:
+        yield
+        return
+    path = a.job_control_file
+    if not a.job_id:
+        raise RuntimeError('job control requires a stable backend job ID')
+    fence = path.parent / 'job.lock'
+    with private_file(fence) as handle:
+        if not lock_within(handle, fcntl.LOCK_EX, 5):
+            raise RuntimeError('job control lock is held; launch and cancellation cannot be ordered')
+        with private_file(path) as control:
+            item = json.load(control)
+        if (not isinstance(item, dict) or item.get('backend_job_id') != a.job_id
+                or item.get('owner') != a.owner or type(item.get('cancel_requested')) is not bool
+                or type(item.get('accepted',True)) is not bool):
+            raise RuntimeError('job control identity mismatch')
+        if item['cancel_requested']:
+            raise Cancelled('owned job cancelled')
+        if require_accepted and not item.get('accepted',True):
+            raise CapacityUnavailable('durable submission acceptance pending')
+        if mark_running:
+            item['state']='running';item['execution_committed']=True
+            temporary=path.with_name(path.name+'.launch-'+str(os.getpid()))
+            descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(descriptor,'w') as output:
+                json.dump(item,output);output.flush();os.fsync(output.fileno())
+            os.replace(temporary,path)
+            descriptor=os.open(path.parent,os.O_RDONLY)
+            try:os.fsync(descriptor)
+            finally:os.close(descriptor)
+        yield item
+
+def publish_preflight_cancellation():
+    if child is not None or record is not None or not a.job_control_file or not a.job_id:
+        return
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}',a.job_id):
+        raise RuntimeError('invalid cancellation identity')
+    with private_file(a.job_control_file) as stream:
+        item=json.load(stream)
+    command=a.command[1:] if a.command[:1]==['--'] else a.command
+    if (item.get('backend_job_id')!=a.job_id or item.get('owner')!=a.owner
+            or item.get('cancel_requested') is not True or item.get('argv')!=command
+            or item.get('cwd')!=os.getcwd()):
+        raise RuntimeError('cancellation control identity mismatch')
+    home=Path(app_home)
+    if home.is_symlink():raise RuntimeError('unsafe guardian home')
+    registry=home/'guard-reservations'
+    registry.mkdir(mode=0o700,parents=True,exist_ok=True)
+    if registry.is_symlink() or registry.stat().st_uid!=os.getuid():
+        raise RuntimeError('unsafe cancellation receipt directory')
+    destination=registry/(a.job_id+'.result')
+    if destination.is_symlink():raise RuntimeError('unsafe cancellation receipt')
+    if destination.exists():return  # Immutable prior outcomes always win.
+    digest=hashlib.sha256(json.dumps([command,os.getcwd(),a.owner,str(a.artifact_root)]).encode()).hexdigest()
+    durable_result(destination,{'owner':a.owner,'command_hash':digest,'exit_code':143,'status':'cancelled','no_launch':True})
+
+def check_cancelled():
+    with control_decision():
+        pass
+
+def retry_capacity(check):
+    # Only a job's own handshake is awaited here: durable acceptance of its
+    # submission, or reattachment to its own live guardian. Capacity never queues.
+    global last_reason, last_notice
+    delay = .01
+    while True:
+        check_cancelled()
+        try:
+            return check()
+        except Refused:
+            raise
+        except CapacityUnavailable as error:
+            check_cancelled()
+            remaining = deadline - time.monotonic()
+            if a.once or remaining <= 0:
+                raise
+            now = time.monotonic()
+            if not a.quiet and (str(error) != last_reason or now - last_notice >= min(30, max(1, a.wait_seconds))):
+                print('Waiting: ' + str(error), file=sys.stderr, flush=True)
+                last_reason, last_notice = str(error), now
+            time.sleep(min(delay, remaining))
+            delay = min(.25, delay * 1.6)
+
+def pressure(error, *, advisory=False):
+    message = str(error)
+    if message not in warnings:
+        warnings.append(message)
+        del warnings[:-16]
+        if not a.quiet: print(('Storage advisory: ' if advisory else 'Capacity advisory; running job preserved: ') + message, file=sys.stderr, flush=True)
+
+def stop_owned():
+    # Do not reap the leader before signalling its session: its PID then cannot
+    # be recycled into an unrelated process group during teardown.
+    if child is not None and child.returncode is None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+            if runtime_enabled:
+                # The external controller must reacquire the cache fence before
+                # thawing and terminating a pressure-blocked owned session.
+                child.wait(timeout=130)
+                return
+            time.sleep(.2)
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait(timeout=4)
+
+def allocated_bytes(path, seconds=120):
+    try:
+        result = subprocess.run(['du', '-x', '-k', '-s', str(path)],
+                                capture_output=True, text=True, timeout=seconds)
+    except subprocess.TimeoutExpired as error:
+        raise CapacityUnavailable('retention inventory unknown: bounded %gs measurement timed out' % seconds) from error
+    if result.returncode:
+        raise CapacityUnavailable('cannot measure retention safely')
+    return int(result.stdout.split()[0]) * 1024
+
+def retained(force=False, seconds=120):
+    if not a.artifact_root:
+        return 0
+    s = a.artifact_root.lstat()
+    if not stat.S_ISDIR(s.st_mode) or (s.st_dev, s.st_ino) != identity:
+        raise RuntimeError('artifact root identity changed; outputs preserved')
+    aggregate = (a.retention_root or a.artifact_root).resolve(strict=True)
+    observed = aggregate.lstat()
+    if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != retention_identity:
+        raise RuntimeError('retention root identity changed; outputs preserved')
+    cache = Path(app_home) / ('retention-' + hashlib.sha256(str(aggregate).encode()).hexdigest()[:20] + '.json')
+    if cache.is_symlink():raise RuntimeError('unsafe retention cache')
+    def cached():
+        try:
+            saved = json.loads(cache.read_text())
+            age = time.time()-saved['at']
+            if 0 <= age < 5 and saved['identity']==list(retention_identity) and saved.get('strategy')=='single-flight-v1' and isinstance(saved.get('measurement_started'),(int,float)) and 0 <= saved['measurement_started'] <= saved['at']:
+                size=saved['bytes']
+                if not isinstance(size,int) or size < 0:raise ValueError('invalid inventory')
+                if size>a.max_retained_gib*2**30:pressure(CapacityUnavailable('historical retention threshold exceeded; advisory only; outputs preserved'), advisory=True)
+                return size
+        except (OSError,ValueError,KeyError,TypeError):pass
+        return None
+    # Even monitor/terminal callers share a bounded-fresh inventory. They must
+    # not each force a competing traversal of the same slow external tree.
+    size=None if force else cached()
+    if size is not None:return size
+    scan_lock=cache.with_suffix('.scan.lock')
+    if scan_lock.is_symlink():raise RuntimeError('unsafe retention inventory lock')
+    descriptor=os.open(scan_lock,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    with os.fdopen(descriptor,'a+') as scan:
+        try:fcntl.flock(scan,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            size=None if force else cached()
+            if size is not None:return size
+            raise CapacityUnavailable('retention inventory unknown: shared measurement in progress')
+        size=None if force else cached()
+        if size is not None:return size
+        status=cache.with_suffix('.scan-status.json')
+        if status.is_symlink():raise RuntimeError('unsafe retention status')
+        try:
+            previous=json.loads(status.read_text())
+            if previous.get('state')=='unknown' and 0 <= time.time()-previous['at'] < 15:
+                raise CapacityUnavailable('retention inventory unknown: bounded refresh backoff')
+        except (OSError,ValueError,KeyError,TypeError):pass
+        began=time.time()
+        def write_status(state,**fields):
+            if status.is_symlink():raise RuntimeError('unsafe retention status')
+            temp=status.with_name(status.name+'.'+str(os.getpid()))
+            temp.write_text(json.dumps(dict(state=state,at=time.time(),started=began,pid=os.getpid(),**fields)))
+            os.replace(temp,status)
+        write_status('measuring')
+        try:
+            size=allocated_bytes(aggregate, seconds)
+            end=aggregate.lstat()
+            if aggregate.is_symlink() or (end.st_dev,end.st_ino)!=retention_identity:
+                raise RuntimeError('retention root changed during inventory')
+        except (CapacityUnavailable,OSError,ValueError,subprocess.SubprocessError) as error:
+            write_status('unknown',error=type(error).__name__)
+            raise
+        if cache.is_symlink():raise RuntimeError('unsafe retention cache')
+        temporary=cache.with_name(cache.name+'.'+str(os.getpid()))
+        temporary.write_text(json.dumps({'at':time.time(),'identity':list(retention_identity),'bytes':size,'measurement_started':began,'measurement_seconds':time.time()-began,'strategy':'single-flight-v1'}))
+        os.replace(temporary,cache)
+        write_status('known',bytes=size)
+        if size > a.max_retained_gib * 2**30:
+            pressure(CapacityUnavailable('historical retention threshold exceeded; advisory only; outputs preserved'), advisory=True)
+        return size
+
+def headroom(path, device, reserve, free):
+    if not a.quiet and a.warn_free_gib and free < a.warn_free_gib * 2**30 and device not in headroom_notices:
+        headroom_notices.add(device)
+        print('Storage headroom warning: ' + str(path) +
+              ' has %.2f GiB free, below the %.2f GiB planning threshold; '
+              'hard reserve remains %.2f GiB. Review retained generated outputs before the safety floor is reached.' %
+              (free / 2**30, a.warn_free_gib, reserve), file=sys.stderr, flush=True)
+
+def observe(planned=0):
+    result = {}
+    for path, device, reserve in volumes:
+        if path.is_symlink() or not os.path.ismount(path) or path.stat().st_dev != device:
+            raise CapacityUnavailable('required mount missing or changed: ' + str(path))
+        free = shutil.disk_usage(path).free
+        headroom(path, device, reserve, free)
+        pending = planned.get(str(path), 0) if isinstance(planned, dict) else planned
+        if free - pending < reserve * 2**30:
+            raise CapacityUnavailable('free-space reserve admission failed: ' + str(path))
+        result[str(path)] = free
+    return result
+
+def save(code, reason):
+    if marker is None:
+        return
+    s = a.artifact_root.lstat()
+    if a.artifact_root.is_symlink() or (s.st_dev, s.st_ino) != identity:
+        raise RuntimeError('owner root changed; refusing to overwrite metadata')
+    if marker.is_symlink():
+        raise RuntimeError('owner metadata became a symlink')
+    marker.write_text(json.dumps(dict(owner=a.owner, pid=os.getpid(),
+                                     exit_code=code, reason=reason,
+                                     job_id=record['id'] if record else None,guard_protocol=2,
+                                     planned_gib=a.planned_gib,max_growth_gib=a.max_growth_gib,work_class=a.work_class,
+                                     capacity_warnings=warnings,
+                                     updated_at=time.time())) + '\n')
+
+try:
+    for value in [a.root_reserve_gib, a.warn_free_gib, a.planned_gib, a.max_growth_gib, a.max_retained_gib, a.wait_seconds, a.memory_gib, a.recovery_after_seconds]+([a.deadline_seconds] if a.deadline_seconds is not None else []):
+        if not math.isfinite(value) or value < 0:
+            raise RuntimeError('reserve and budget values must be finite and nonnegative')
+    if a.submitted_at is not None and (not math.isfinite(a.submitted_at) or not 0 <= a.submitted_at <= time.time()):
+        raise RuntimeError('submission time must be finite, nonnegative, and not in the future')
+    check_cancelled()
+    if a.job_log_file:
+        log_path=a.job_log_file
+        if (not log_path.is_absolute() or log_path.resolve() != log_path
+                or log_path.parent.stat().st_uid != os.getuid()
+                or log_path.parent.stat().st_mode & 0o077):
+            raise RuntimeError('command log requires a private canonical owned directory')
+        descriptor=os.open(log_path,os.O_CREAT|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+        os.close(descriptor)
+        with private_file(log_path):pass
+    root = Path(data_path).resolve()
+    while not os.path.ismount(root):
+        root = root.parent
+    volumes = [(root, root.stat().st_dev, a.root_reserve_gib)]
+    for name, floor in a.volume:
+        mount = Path(name)
+        reserve = float(floor)
+        if not math.isfinite(reserve) or reserve < 0:
+            raise RuntimeError('invalid volume reserve')
+        if not mount.is_absolute() or mount.is_symlink():raise RuntimeError('unsafe external mount path: '+name)
+        if mode == 'admit' and not os.path.ismount(mount):
+            raise CapacityUnavailable('required external mount is absent: '+name)
+        volumes.append((mount, mount.stat().st_dev if os.path.ismount(mount) else None, reserve))
+    write_budgets = {}
+    for name, amount in a.write_budget:
+        if name not in {str(path) for path, _, _ in volumes} or name in write_budgets:
+            raise RuntimeError('write budget must name one unique required mount: '+name)
+        amount = float(amount)
+        if not math.isfinite(amount) or amount < 0:
+            raise RuntimeError('write budgets must be finite and nonnegative')
+        write_budgets[name] = amount * 2**30
+    before = observe() if mode == 'admit' else {}
+    if a.retention_root and not a.artifact_root:
+        raise RuntimeError('retention root requires an owned artifact root')
+    if a.artifact_root:
+        if not a.owner:
+            raise RuntimeError('an explicit owner is required for an artifact root')
+        s = a.artifact_root.lstat()
+        if not stat.S_ISDIR(s.st_mode):
+            raise RuntimeError('artifact root must be an existing ordinary directory')
+        identity = (s.st_dev, s.st_ino)
+        aggregate = a.retention_root or a.artifact_root
+        require_shared_retention_scope(a.artifact_root, aggregate)
+        s = aggregate.lstat()
+        if not stat.S_ISDIR(s.st_mode):
+            raise RuntimeError('retention root must be an ordinary directory')
+        if os.path.commonpath([str(a.artifact_root.resolve()), str(aggregate.resolve())]) != str(aggregate.resolve()):
+            raise RuntimeError('artifact root must be inside its retention root')
+        retention_identity = (s.st_dev, s.st_ino)
+        candidate = a.artifact_root / '.disk-janitor-owner.json'
+        if candidate.is_symlink():
+            raise RuntimeError('owner metadata must not be a symlink')
+        if candidate.exists():
+            if candidate.stat().st_size > 4096 or json.loads(candidate.read_text()).get('owner') != a.owner:
+                raise RuntimeError('artifact owner mismatch; existing outputs preserved')
+        if mode == 'admit':retry_capacity(retained)
+    for value in (a.reclaim_seconds, a.lock_seconds, a.max_queue_seconds, a.max_running):
+        if not math.isfinite(value) or value < 0:
+            raise RuntimeError('reserve and budget values must be finite and nonnegative')
+    if mode == 'admit':
+        before=retry_capacity(lambda:observe({str(path):write_budgets.get(str(path),a.planned_gib*2**30) for path,_,_ in volumes}))
+        print(json.dumps(dict(admitted=True, free_bytes=before, planned_gib=a.planned_gib)))
+        raise SystemExit(0)
+    command = a.command[1:] if a.command[:1] == ['--'] else a.command
+    if not command:
+        raise RuntimeError('guard requires -- COMMAND; use admit for a read-only check')
+    if not a.owner:
+        raise RuntimeError('guard requires an explicit owner')
+    if a.restartable and (not a.restart_kind or a.work_class == 'service'):
+        raise RuntimeError('restartable jobs must explicitly declare disposable build/test/preview work, never a service, deployment or migration')
+    home = Path(app_home)
+    if home.is_symlink():
+        raise RuntimeError('guard home must not be a symlink')
+    home.mkdir(parents=True, exist_ok=True)
+    registry=home/'guard-reservations'
+    registry.mkdir(mode=0o700,exist_ok=True)
+    if registry.is_symlink():raise RuntimeError('reservation directory must not be a symlink')
+    legacy=home/'guard.lock'
+    if legacy.is_symlink():raise RuntimeError('admission locks must not be symlinks')
+    lock=legacy.open('a')
+
+    command_hash=hashlib.sha256(json.dumps([command,os.getcwd(),a.owner,str(a.artifact_root)]).encode()).hexdigest()
+    job_id=a.job_id or uuid.uuid4().hex
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}',job_id):raise RuntimeError('invalid job ID')
+    job_path=registry/(job_id+'.json')
+    result_file=registry/(job_id+'.result')
+
+    def write_record():
+        reservation.seek(0);reservation.truncate();json.dump(record,reservation);reservation.flush()
+
+    def retire_records():
+        # This job's reservation stays, locked, until the process is gone: observers
+        # treat that lock as execution still ending. Records other guardians left
+        # behind are retired here, so the registry stays small without any scheduler.
+        try:
+            from capacity import sweep_registry
+            sweep_registry(home)
+        except (OSError,ValueError,KeyError,TypeError,ImportError):pass
+
+    def claim():
+        global reservation,record
+        if job_path.is_symlink() or result_file.is_symlink():raise RuntimeError('unsafe job path')
+        raw=''
+        try:
+            descriptor=os.open(job_path,os.O_RDWR|os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if result_file.exists():
+                saved=json.loads(result_file.read_text())
+                if saved['owner']!=a.owner or saved['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
+                if not a.quiet: print('Previously completed job '+job_id+'; command was not repeated',flush=True)
+                raise SystemExit(saved['exit_code'])
+            # Publish a new reservation already locked and complete enough to own:
+            # no reader ever sees it empty or unowned, so no shared mutex is needed.
+            staged=registry/(job_id+'.claim-'+os.urandom(8).hex())
+            descriptor=os.open(staged,os.O_CREAT|os.O_EXCL|os.O_RDWR|os.O_NOFOLLOW,0o600)
+            try:
+                fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                os.link(staged,job_path)
+            except FileExistsError:
+                os.close(descriptor)
+                raise CapacityUnavailable('reattaching to accepted job '+job_id+' owned by '+a.owner)
+            finally:os.unlink(staged)
+            reservation=os.fdopen(descriptor,'a+')
+        else:
+            reservation=os.fdopen(descriptor,'a+')
+            try:fcntl.flock(reservation,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                reservation.seek(0)
+                try:saved=json.load(reservation)
+                except ValueError:saved=None
+                reservation.close();reservation=None
+                if saved is not None and (saved['owner']!=a.owner or saved['command_hash']!=command_hash):raise RuntimeError('job identity mismatch')
+                raise CapacityUnavailable('reattaching to accepted job '+job_id+' owned by '+a.owner)
+            try:current=job_path.lstat().st_ino
+            except FileNotFoundError:current=None
+            if os.fstat(reservation.fileno()).st_ino!=current:
+                # Retired between open and lock; the next attempt reads its result.
+                reservation.close();reservation=None
+                raise CapacityUnavailable('reattaching to accepted job '+job_id+' owned by '+a.owner)
+            if result_file.exists():
+                saved=json.loads(result_file.read_text())
+                if saved['owner']!=a.owner or saved['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
+                if not a.quiet: print('Previously completed job '+job_id+'; command was not repeated',flush=True)
+                raise SystemExit(saved['exit_code'])
+            reservation.seek(0);raw=reservation.read()
+        if raw:
+            previous=json.loads(raw)
+            if previous['owner']!=a.owner or previous['command_hash']!=command_hash:raise RuntimeError('job identity mismatch')
+            if previous.get('state')=='running':
+                with control_decision() as control:
+                    if (not a.job_control_file or control.get('execution_committed') or previous.get('child') is not None):
+                        raise RuntimeError('previous command outcome is uncertain; outputs retained for '+job_id)
+        # Estimates are recorded for the owner, never held against other jobs: budget
+        # and memory stay zero so no reader counts this job as a claim on capacity.
+        record={'id':job_id,'owner':a.owner,'pid':os.getpid(),'command_hash':command_hash,
+                'state':'waiting','created':a.submitted_at if a.submitted_at is not None else previous.get('created',time.time()) if raw else time.time(),'budget':0,'planned':a.planned_gib*2**30,
+                'retention_limit':a.max_retained_gib*2**30,'memory':0,'class':a.work_class,'artifact':str(a.artifact_root.resolve()) if a.artifact_root else None,
+                'retention':str((a.retention_root or a.artifact_root).resolve()) if a.artifact_root else None,'retention_identity':list(retention_identity) if a.artifact_root else None,'volumes':[{'path':str(p),'device':d,'reserve':r*2**30,'budget':0} for p,d,r in volumes],
+                'child':None,'runtime_file':str(registry/(job_id+'.runtime')),'consumed':{},'restartable':a.restartable,'restart_kind':a.restart_kind,'preemptions':0}
+        write_record()
+    retry_capacity(claim)
+
+    def free_bytes():
+        free={}
+        for path,device,reserve in volumes:
+            if device is None or path.is_symlink() or not os.path.ismount(path) or path.stat().st_dev!=device:
+                raise Refused('required mount is absent or changed: '+str(path))
+            free[str(path)]=shutil.disk_usage(path).free
+        return free
+
+    def below_floor(free):
+        return {str(path):reserve*2**30 for path,_,reserve in volumes if free[str(path)]<reserve*2**30}
+
+    def reclaim(short):
+        # One synchronous pass of the existing recovery, bounded in time. It owns
+        # classification, activity proof and deletion; this job only waits briefly.
+        module=Path(os.environ['DISK_JANITOR_RUNTIME_DIR'])/'recovery.py'
+        if not module.is_file() or module.is_symlink():return None
+        args=[sys.executable,'-B',str(module),'--apply','--pressure-only','--time-limit',str(a.reclaim_seconds),
+              '--report',str(home/'recovery-last.json')]
+        for name,required in short.items():args+=['--need',name+'='+str(int(required))]
+        try:
+            done=subprocess.run(args,capture_output=True,text=True,timeout=a.reclaim_seconds+1.5)
+            return int(json.loads(done.stdout)['removed_allocated_bytes'])
+        except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError):return None
+
+    def memory_critical():
+        if sys.platform!='darwin':return False
+        try:
+            level=subprocess.run(['sysctl','-n','kern.memorystatus_vm_pressure_level'],capture_output=True,text=True,timeout=1)
+        except (OSError,subprocess.SubprocessError):return False
+        return level.returncode==0 and level.stdout.strip().isdigit() and int(level.stdout.strip())>=4
+
+    def wait_for_slot():
+        # The only reason a job waits: every slot is held by a running job. Slots are
+        # kernel locks and the queue is locked tickets, so nothing stale holds either.
+        from capacity import slot_limit, take_slot, join_queue, waiting_tickets
+        from commitments import Commitments
+        limit=a.max_running or slot_limit()
+        asked=0
+        def runners():
+            # Work an external broker (docs/admission-protocol.md) has committed is work
+            # this machine is running, so each commitment takes a slot. One slot always
+            # stays open to local jobs: a commitment never withdrawn cannot hold them all.
+            claims,problems=Commitments().gather(guard_home=home)
+            for problem in problems:
+                if problem not in warnings:warnings.append(problem);notice('external commitments ignored: '+problem)
+            return min(limit-1,len(claims))
+        submitted=record['created']
+        # A job that yielded its slot queues again from now, behind the job it yielded to.
+        ticket,ticket_fd=join_queue(home,time.time() if record.get('preemptions') else submitted,job_id)
+        granted=ticket.with_name(ticket.name+'.go')
+        try:
+            while True:
+                check_cancelled()
+                ahead=[name for name in waiting_tickets(home) if name<ticket.name]
+                ci=runners()
+                if not ahead or granted.exists():
+                    held=take_slot(home,limit-ci)
+                    if held is not None:return held
+                waited=time.time()-submitted
+                if a.once or time.monotonic()>=deadline or waited>a.max_queue_seconds:
+                    raise Refused('no free slot after %.0f s: all %d slots are running jobs%s and %d earlier jobs are waiting'
+                                  % (max(0,waited),limit,' (%d held by external broker commitments)'%ci if ci else '',len(ahead)))
+                os.utime(ticket_fd)  # Still polling: jobs behind this one know it is live.
+                if a.work_class=='feedback' and not ahead and time.monotonic()-asked>=1:
+                    # Existing contract: an explicitly restartable build may yield its
+                    # slot to waiting feedback work. Only its own guardian stops it.
+                    asked=time.monotonic()
+                    try:
+                        from capacity import request_preemption
+                        request_preemption(home,job_id)
+                    except (OSError,ValueError,KeyError,TypeError,AttributeError,ImportError):pass
+                time.sleep(.25)
+        finally:
+            for name in (ticket,granted):
+                try:name.unlink()
+                except OSError:pass
+            os.close(ticket_fd)
+
+    def acquire():
+        # Wait only for a slot. Other jobs' records, retention inventory, a running
+        # recovery and busy locks are never consulted, and disk is decided once the
+        # slot is held: the job starts, or it fails with the reason it cannot.
+        global before,marker,slot
+        with control_decision(require_accepted=True):pass
+        if not a.light and slot is None:slot=wait_for_slot()
+        if a.light:
+            # No build tool runs, so no headroom is required and no cache is in use.
+            free={str(path):shutil.disk_usage(path).free for path,device,_ in volumes if device is not None}
+        else:
+            free=free_bytes()
+            short=below_floor(free)
+            if short:
+                earlier=free
+                removed=reclaim(short)
+                free=free_bytes()
+                short=below_floor(free)
+                if short:
+                    name=sorted(short)[0]
+                    freed=removed if removed is not None else max(0,free[name]-earlier[name])
+                    raise Refused('insufficient disk: %.2f GiB free on %s, need %.2f GiB; reclaim freed %.2f GiB'
+                                  % (free[name]/2**30,name,short[name]/2**30,freed/2**30))
+            for path,device,reserve in volumes:headroom(path,device,reserve,free[str(path)])
+            if memory_critical():
+                raise Refused('critical memory pressure: the machine has no memory to start more work')
+            # The shared fence only keeps guard binaries that predate per-unit activity
+            # proof from overlapping this job. Recovery no longer needs it to run.
+            if not lock_within(lock,fcntl.LOCK_SH):
+                notice('cache fence is held exclusively; started without it')
+        record['state']='running';write_record();before=free
+        marker=candidate if a.artifact_root else None
+        save(None,'running')
+    retry_capacity(acquire)
+    while True:
+        check_cancelled()
+        baseline_artifact=0
+        if a.artifact_root:
+            try:baseline_artifact=allocated_bytes(a.artifact_root,5)
+            except CapacityUnavailable as error:pressure(error,advisory=True)
+        if not a.quiet: print('Admitted '+job_id+' ('+a.owner+')',flush=True)
+        environment = dict(os.environ)
+        if a.artifact_root:
+            environment['DISK_JANITOR_ARTIFACT_ROOT'] = str(a.artifact_root.resolve())
+        # Keep a directly owned session leader alive after the command exits. On
+        # Darwin, signalling a group whose leader is already a zombie can fail.
+        read_fd, write_fd = os.pipe()
+        supervisor = '''import json,os,selectors,signal,stat,subprocess,sys,time
+from pathlib import Path
+fd=int(sys.argv[1])
+def durable_result(path, payload):
+    temporary=path.with_name(path.name+'.receipt-'+os.urandom(8).hex())
+    descriptor=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(descriptor,'w') as output:
+        json.dump(payload,output);output.flush();os.fsync(output.fileno())
+    os.replace(temporary,path)
+    descriptor=os.open(path.parent,os.O_RDONLY)
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+if sys.argv[3]=='build':
+    try: os.nice(5)
+    except OSError: pass  # Niceness is optional; sandbox policy may forbid it.
+signal.signal(signal.SIGTERM,lambda *_:None)
+sys.dont_write_bytecode=True
+sys.path.insert(0,os.environ['DISK_JANITOR_RUNTIME_DIR'])
+from capacity import install_parent_death_resume
+freeze_safe=install_parent_death_resume(int(os.environ['DISK_JANITOR_GUARD_FD']),int(sys.argv[4]))
+ready=int(os.environ.pop('DISK_JANITOR_CONTROLLER_READY_FD','-1'))
+if ready>=0:
+    os.write(ready,b'1' if freeze_safe else b'0');os.close(ready)
+gate=int(os.environ.pop('DISK_JANITOR_START_FD','-1'))
+if gate>=0:
+    try:
+        if os.read(gate,1)!=b'1':raise SystemExit(125)
+    finally:os.close(gate)
+process=None
+cancel_at=None
+control_path=Path(sys.argv[9]) if len(sys.argv)>9 and sys.argv[9] else None
+def cancel_owned():
+    global cancel_at
+    if control_path and cancel_at is None:
+        try:
+            parent=control_path.parent.stat()
+            if (control_path.resolve(strict=True)==control_path and parent.st_uid==os.getuid()
+                    and not parent.st_mode&0o077):
+                descriptor=os.open(control_path,os.O_RDONLY|os.O_NOFOLLOW)
+                with os.fdopen(descriptor) as stream:
+                    info=os.fstat(stream.fileno())
+                    item=json.load(stream)
+                if (stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and not info.st_mode&0o077
+                        and item.get('owner')==sys.argv[6] and item.get('backend_job_id')==sys.argv[10]
+                        and item.get('cancel_requested') is True):
+                    cancel_at=time.monotonic()
+                    os.killpg(os.getpgrp(),signal.SIGTERM)
+        except (OSError,ValueError,KeyError):pass
+    if cancel_at is not None and process is not None and process.poll() is None and time.monotonic()-cancel_at>=.2:
+        process.kill()  # Direct unreaped child, never a persisted PID.
+try:
+    log_fd=int(sys.argv[8])
+    if log_fd<0:
+        process=subprocess.Popen(json.loads(sys.argv[2]),stdin=None if os.environ.get('DISK_JANITOR_FOREGROUND_STDIO')=='1' else subprocess.DEVNULL)
+        while process.poll() is None:
+            cancel_owned();time.sleep(.05)
+        code=process.returncode
+    else:
+        # The supervisor owns the reader and bounded tail, so losing a frontend
+        # or guardian does not close the command's output pipe. A descendant may
+        # inherit stdout; leader completion, never pipe EOF, ends collection.
+        process=subprocess.Popen(json.loads(sys.argv[2]),stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        os.set_blocking(process.stdout.fileno(),False)
+        selector=selectors.DefaultSelector()
+        selector.register(process.stdout,selectors.EVENT_READ)
+        tail=b''
+        def drain():
+            global tail
+            for _ in range(16):
+                try: chunk=os.read(process.stdout.fileno(),65536)
+                except BlockingIOError: break
+                if not chunk: break
+                tail=(tail+chunk)[-262144:]
+                os.lseek(log_fd,0,os.SEEK_SET)
+                view=memoryview(tail)
+                while view:
+                    view=view[os.write(log_fd,view):]
+                os.ftruncate(log_fd,len(tail))
+        while process.poll() is None:
+            cancel_owned()
+            if selector.select(.05): drain()
+        drain()
+        code=process.returncode
+        selector.close();process.stdout.close();os.close(log_fd)
+    result={"exit_code":143 if cancel_at is not None else code if code>=0 else 128-code}
+except OSError as error:
+    result={"error":str(error)}
+    if process is None:
+        result['exit_code']=126 if error.errno in (1,13) else 127
+        if log_fd>=0:
+            try:os.write(log_fd,('Unable to start command: '+str(error)+'\\n').encode());os.close(log_fd)
+            except OSError:pass
+if 'exit_code' in result:
+    durable_result(Path(sys.argv[5]).with_suffix('.outcome'),{'owner':sys.argv[6],'command_hash':sys.argv[7],'exit_code':result['exit_code'],'status':'command-completed'})
+try:os.write(fd,(json.dumps(result)+"\\n").encode())
+except BrokenPipeError:pass
+finally:os.close(fd)
+while os.getppid()==int(sys.argv[4]): time.sleep(.1)
+# The command has finished and its guardian died. Keep the inherited reservation
+# until owned descendants have been signalled; then publish the actual outcome.
+os.killpg(os.getpgrp(),signal.SIGTERM);time.sleep(.2)
+if 'exit_code' in result:
+    path=Path(sys.argv[5]);temp=path.with_name(path.name+'.'+str(os.getpid()))
+    durable_result(path,{'owner':sys.argv[6],'command_hash':sys.argv[7],'exit_code':result['exit_code']})
+os.killpg(os.getpgrp(),signal.SIGKILL)
+'''
+        log_descriptor=-1
+        if a.job_log_file:
+            log_descriptor=os.open(a.job_log_file,os.O_WRONLY|os.O_NOFOLLOW)
+            info=os.fstat(log_descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
+                os.close(log_descriptor);raise RuntimeError('unsafe command log')
+        module=Path(os.environ.get('DISK_JANITOR_RUNTIME_DIR',str(Path.cwd()/'bin')))/'capacity.py'
+        if not module.is_file() or module.is_symlink():raise RuntimeError('owned runtime controller is unavailable')
+        start_read,start_write=os.pipe()
+        inherited=(write_fd,reservation.fileno(),lock.fileno())+((log_descriptor,) if log_descriptor>=0 else ())+((slot,) if slot is not None else ())
+        runtime_config={'volumes':[dict(path=str(path),device=device,reserve=0 if a.light else reserve*2**30,mount_required=True) for path,device,reserve in volumes if device is not None],
+                        'runtime_file':str(registry/(job_id+'.runtime')),'outcome_file':str(registry/(job_id+'.outcome')),
+                        'result_file':str(result_file),'guard_fd':lock.fileno(),'start_fd':start_read,
+                        'control_file':str(a.job_control_file or ''),'foreground_stdio':a.foreground_stdio,
+                        'identity':dict(owner=a.owner,command_hash=command_hash,job_id=job_id),
+                        'learning_key':hashlib.sha256(json.dumps([command,os.getcwd()]).encode()).hexdigest()}
+        supervisor_command=[sys.executable,'-c',supervisor,str(write_fd),json.dumps(command),a.work_class,str(os.getpid()),str(result_file),a.owner,command_hash,str(log_descriptor),str(a.job_control_file or ''),job_id]
+        if a.foreground_stdio:environment['DISK_JANITOR_FOREGROUND_STDIO']='1'
+        with control_decision(require_accepted=True,mark_running=True):
+            child=subprocess.Popen([sys.executable,'-B',str(module),json.dumps(runtime_config),json.dumps(supervisor_command),json.dumps(inherited)],
+                                   stdin=9 if a.foreground_stdio else subprocess.DEVNULL,env=environment,
+                                   start_new_session=True,pass_fds=inherited+(start_read,))
+            runtime_enabled=True
+        os.close(start_read)
+        if log_descriptor>=0:os.close(log_descriptor)
+        os.close(write_fd)
+        record['child']=child.pid;write_record()
+        os.write(start_write,b'1');os.close(start_write)
+        watcher = selectors.DefaultSelector()
+        watcher.register(read_fd, selectors.EVENT_READ)
+        result = None
+        next_measure=0
+        preemption_path=registry/(job_id+'.preempt-request')
+        while result is None:
+            check_cancelled()
+            if watcher.select(.2):
+                data = os.read(read_fd, 65536)
+                if not data:
+                    raise RuntimeError('owned supervisor exited without a result')
+                result = json.loads(data)
+                break
+            if a.restartable and record.get('preemptions',0)<2 and not preemption_path.is_symlink() and preemption_path.exists():
+                try:
+                    request=json.loads(preemption_path.read_text())
+                    requester_path=registry/(request['requester']+'.json')
+                    requester=json.loads(requester_path.read_text()) if not requester_path.is_symlink() else {}
+                    valid=(request.get('id')==job_id and request.get('owner')==a.owner
+                           and request.get('command_hash')==command_hash and request.get('child')==child.pid
+                           and 0<=time.time()-request.get('created',0)<60
+                           and requester.get('state')=='waiting' and requester.get('class')=='feedback'
+                           and a.work_class=='build' and a.restart_kind in {'build','test','preview'})
+                    preemption_path.unlink()
+                    if valid:
+                        result={'_preempted':True}
+                        break
+                except (OSError,ValueError,KeyError,TypeError):pass
+            try:
+                runtime_state=json.loads((registry/(job_id+'.runtime')).read_text())
+                if runtime_state.get('state')=='pressure-blocked':
+                    pressure(CapacityUnavailable(runtime_state.get('reason','owned job pressure-blocked')))
+                    continue
+            except (OSError,ValueError):pass
+            if time.monotonic()<next_measure:continue
+            next_measure=time.monotonic()+5
+            try:
+                now = observe()
+                growth = sum(max(0, before[name] - free) for name, free in now.items())
+                if growth > a.max_growth_gib * 2**30:
+                    raise CapacityUnavailable('physical volume growth budget exceeded')
+                retained()
+                if a.artifact_root:
+                    consumed=max(0,allocated_bytes(a.artifact_root)-baseline_artifact)
+                    record['overrun']=consumed>record['planned']
+                    for volume in record['volumes']:
+                        if volume['device']==identity[0]:record['consumed'][volume['path']]=min(record['planned'],consumed)
+                    write_record()
+            except (CapacityUnavailable, subprocess.TimeoutExpired) as error:
+                pressure(error)
+        watcher.close()
+        os.close(read_fd)
+        stop_owned()
+        if not result.get('_preempted'):
+            break
+        if slot is not None:
+            os.close(slot);slot=None
+        record['preemptions']=record.get('preemptions',0)+1
+        record['state']='waiting';record['child']=None;record['yield_until']=time.time()+1
+        record['consumed']={};write_record()
+        # Explicit cooperative retries have distinct attempt receipts. All
+        # previous writers are reaped before removing the current-attempt view.
+        for suffix in ('.outcome','.result'):
+            prior=registry/(job_id+suffix)
+            if prior.exists():
+                saved=json.loads(prior.read_text())
+                if saved.get('owner')!=a.owner or saved.get('command_hash')!=command_hash:raise RuntimeError('preemption outcome identity mismatch')
+                os.replace(prior,registry/(job_id+'.preempt-'+str(record['preemptions'])+suffix))
+        # The same owning guardian retries its exact opt-in command after teardown.
+        # No other agent signals a process or replays an uncertain completed action.
+        retry_capacity(acquire)
+    if 'error' in result and 'exit_code' not in result:
+        raise RuntimeError('command outcome unavailable: ' + result['error'])
+    if 'error' in result and not a.job_log_file:
+        print('Unable to start command: '+result['error'],file=sys.stderr)
+    code = result['exit_code']
+    record['finished']=time.time()
+    record['retention_unsettled']=False
+    try:
+        # Advisory inventory after the final writes. It is bounded and settles nothing:
+        # no later job consults it before starting.
+        retained(force=True,seconds=5)
+    except (CapacityUnavailable, subprocess.TimeoutExpired) as error:
+        pressure(error,advisory=True)
+    save(code, 'completed; capacity review required' if warnings else
+         'completed' if code == 0 else 'command failed; outputs retained')
+    record['state']='completed';write_record()
+    durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':code if code>=0 else 128-code})
+    retire_records()
+    raise SystemExit(code if code >= 0 else 128 - code)
+except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    cancellation_teardown_confirmed=False
+    try:
+        stop_owned()
+        cancellation_teardown_confirmed=child is None
+        if child is not None and registry is not None:
+            completed=registry/(job_id+'.runtime')
+            with private_file(completed) as stream:teardown=json.load(stream)
+            cancellation_teardown_confirmed=(teardown.get('state')=='completed' and teardown.get('owner')==a.owner and teardown.get('command_hash')==command_hash and teardown.get('job_id')==job_id and teardown.get('controller_pid')==child.pid)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as cleanup_error:
+        print('ERROR: owned process teardown failed: ' + str(cleanup_error), file=sys.stderr)
+    try:
+        save(125, str(error))
+    except (OSError, RuntimeError) as metadata_error:
+        print('ERROR: failed to record guard result: ' + str(metadata_error), file=sys.stderr)
+    print('ERROR: ' + str(error), file=sys.stderr)
+    if isinstance(error,Cancelled) and record is None:
+        try:publish_preflight_cancellation()
+        except (OSError,ValueError,RuntimeError) as cancellation_error:
+            print('ERROR: could not publish no-launch cancellation: '+str(cancellation_error),file=sys.stderr)
+    if isinstance(error,Cancelled) and record is not None and reservation is not None:
+        record['state']='cancelled';record['cancellation_teardown_confirmed']=cancellation_teardown_confirmed;write_record()
+        durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':143})
+    if isinstance(error,Refused) and record is not None and reservation is not None and child is None:
+        # A refusal is a terminal outcome with its reason, not a wait.
+        try:
+            record['state']='refused';write_record()
+            if not result_file.exists():
+                durable_result(result_file,{'owner':a.owner,'command_hash':command_hash,'exit_code':75,'status':'refused','no_launch':True,'reason':str(error)})
+            if a.job_log_file:
+                descriptor=os.open(a.job_log_file,os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW)
+                with os.fdopen(descriptor,'a') as output:output.write('Not started: '+str(error)+'\n')
+        except (OSError,ValueError,RuntimeError) as refusal_error:
+            print('ERROR: could not publish refusal: '+str(refusal_error),file=sys.stderr)
+    raise SystemExit(143 if isinstance(error,Cancelled) else 75 if isinstance(error, CapacityUnavailable) else 125)
+finally:
+    if slot is not None:
+        os.close(slot)
+    if reservation is not None:
+        reservation.close()
+    if lock is not None:
+        lock.close()
+PY
+}
+
+cmd_reclaim_schedule() {
+  [ "$OS" = Darwin ] || { err "automatic artifact scheduling currently requires launchd"; return 2; }
+  local reclaim_plist="$HOME/Library/LaunchAgents/$APP_NAME-reclaim.plist"
+  mkdir -p "$(dirname "$reclaim_plist")"
+  python3 - "$reclaim_plist" "$SELF_CANONICAL" "$APP_HOME" <<'PY'
+import plistlib, sys
+from pathlib import Path
+path, binary, home = sys.argv[1:]
+with Path(path).open('wb') as stream:
+    plistlib.dump(dict(Label='disk-janitor-reclaim',
+        ProgramArguments=[binary, 'reclaim', '--apply', '--pressure-only', '--report', home + '/reclaim-last.json'],
+        StartInterval=3600, ProcessType='Background', LowPriorityIO=True,
+        StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
+# Every minute: retire dead registry records and restore free space to the low-water
+# mark, so a starting job rarely meets its floor. It takes no lock a job waits on.
+with Path(path).with_name('disk-janitor-watchdog.plist').open('wb') as stream:
+    plistlib.dump(dict(Label='disk-janitor-watchdog',
+        ProgramArguments=[binary, 'recover', '--watchdog'],
+        StartInterval=60, ProcessType='Background', LowPriorityIO=True,
+        StandardOutPath='/dev/null', StandardErrorPath=home + '/reclaim-errors.log'), stream)
+PY
+  if [ -z "$NO_SCHED" ]; then
+    local plist
+    for plist in "$reclaim_plist" "${reclaim_plist%-reclaim.plist}-watchdog.plist"; do
+      launchctl unload "$plist" 2>/dev/null || true
+      launchctl load "$plist" || return 1
+    done
+  fi
+  ok "hourly reviewed-artifact cleanup and one-minute watchdog configured"
+}
+
+cmd_recover() {
+  local module; module="$(runtime_module recovery.py)" || return $?
+  python3 "$module" "$@"
+}
+
+cmd_reclaim() {
+  if [ "${1:-}" != --schedule ]; then
+    local explicit_manifest=0 arg
+    for arg in "$@"; do [ "$arg" != --manifest ] || explicit_manifest=1; done
+    if [ "$explicit_manifest" = 0 ]; then cmd_recover "$@"; return; fi
+  fi
+  if [ "${1:-}" = --schedule ]; then cmd_reclaim_schedule; return; fi
+  python3 - "$APP_HOME" "$@" <<'PY'
+import argparse, fcntl, json, os, shutil, stat, subprocess, sys, time
+from pathlib import Path
+
+app_home = Path(sys.argv[1])
+p = argparse.ArgumentParser(description='Reclaim only reviewed, idle generated output; preview by default')
+p.add_argument('--manifest', type=Path, default=app_home / 'approved-artifacts.json')
+mode = p.add_mutually_exclusive_group()
+mode.add_argument('--apply', action='store_true')
+mode.add_argument('--dry-run', action='store_true', help='explicit non-deleting preview')
+p.add_argument('--report', type=Path)
+a = p.parse_args(sys.argv[2:])
+
+def run(args):
+    return subprocess.run(args, capture_output=True, text=True, timeout=30)
+
+def plain(path):
+    return path.is_absolute() and path == path.resolve() and '\n' not in str(path)
+
+# Only these opt-in kinds accept terminal-job proof in place of elapsed idle time.
+# Generic cleanup retains its existing minimum 24-hour rule.
+TERMINAL_KINDS = {'terminal-gradle-derived', 'terminal-konan-derived'}
+
+terminal_fingerprints = {}
+
+def terminal_snapshot(path, finished_ns):
+    """Bind names, identities, change times and actual bytes, not mtimes alone."""
+    import hashlib
+    rows = []
+    checks = []
+    seen = set()
+    newest_change_ns = 0
+    def metadata(info):
+        return [info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink]
+    def failed(error):
+        raise error
+    for base, dirs, files in os.walk(path, followlinks=False, onerror=failed):
+        for name in ['.'] + sorted(dirs) + sorted(files):
+            item = Path(base) if name == '.' else Path(base) / name
+            relative = item.relative_to(path).as_posix()
+            # Directories appear again as a later base; record each path once.
+            if relative in seen:
+                continue
+            seen.add(relative)
+            before = item.lstat()
+            if before.st_ctime_ns > finished_ns:
+                raise ValueError('terminal output changed after completion (ctime_ns)')
+            if before.st_uid != os.getuid():
+                raise ValueError('terminal output ownership changed')
+            if not (stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)):
+                raise ValueError('terminal output contains a symlink or special file')
+            digest = None
+            if stat.S_ISREG(before.st_mode):
+                hasher = hashlib.sha256()
+                descriptor = os.open(item, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, 'rb') as stream:
+                    if metadata(os.fstat(stream.fileno())) != metadata(before):
+                        raise ValueError('terminal output changed during fingerprinting')
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                        hasher.update(chunk)
+                    if metadata(os.fstat(stream.fileno())) != metadata(before):
+                        raise ValueError('terminal output changed during fingerprinting')
+                digest = hasher.hexdigest()
+            rows.append([relative, metadata(before), digest])
+            checks.append((item, metadata(before)))
+            newest_change_ns = max(newest_change_ns, before.st_ctime_ns)
+    # Catch insertion/removal/rename or changes to a previously hashed file.
+    for item, expected in checks:
+        if metadata(item.lstat()) != expected:
+            raise ValueError('terminal output changed during fingerprinting')
+    payload = json.dumps(sorted(rows), ensure_ascii=True, separators=(',', ':')).encode()
+    return hashlib.sha256(payload).hexdigest(), newest_change_ns
+
+def trusted_image_helper_identity(platform_name, executable, owner, mode):
+    trusted = Path('/System/Library/PrivateFrameworks/DiskImages.framework/Resources/diskimages-helper').resolve()
+    return (platform_name == 'darwin'
+            and executable == str(trusted)
+            and owner == 0 and stat.S_ISREG(mode) and bool(mode & 0o111)
+            and not mode & 0o022)
+
+
+def storage_backend_handle(record, image):
+    # A verified mounted image necessarily has an Apple backing-store handle.
+    # Never exempt a handle to files *inside* the logical mounted filesystem.
+    if image is None or record.get('command') != 'diskimages-helper':
+        return False
+    backing_path = Path(record['path'])
+    if backing_path != image and not backing_path.is_relative_to(image):
+        return False
+    pid = record.get('pid', '')
+    if not isinstance(pid, str) or not pid.isdigit() or int(pid) <= 0:
+        return False
+    process = run(['ps', '-p', pid, '-o', 'comm='])
+    if process.returncode:
+        return False
+    executable = Path(process.stdout.strip())
+    try:
+        if not executable.is_absolute():
+            return False
+        executable = executable.resolve()
+        info = executable.stat()
+    except OSError:
+        return False
+    return trusted_image_helper_identity(sys.platform, str(executable), info.st_uid, info.st_mode)
+
+
+def terminal_context(entry):
+    import hashlib, math, plistlib, re
+    path, scope = Path(entry['path']), Path(entry['scope'])
+    artifact = Path(entry['artifact_root'])
+    source = Path(entry['source'])
+    for candidate in (artifact, source, scope, path):
+        if not plain(candidate) or not candidate.is_dir() or candidate.stat().st_uid != os.getuid():
+            raise ValueError('terminal directory identity or ownership is invalid')
+    receipt_path = artifact / '.disk-janitor-owner.json'
+    if not plain(receipt_path) or receipt_path.stat().st_uid != os.getuid():
+        raise ValueError('terminal receipt ownership is invalid')
+    receipt_bytes = receipt_path.read_bytes()
+    if hashlib.sha256(receipt_bytes).hexdigest() != entry['receipt_sha256']:
+        raise ValueError('terminal receipt changed')
+    receipt = json.loads(receipt_bytes)
+    finished = receipt.get('updated_at')
+    pid = receipt.get('pid')
+    if (receipt.get('guard_protocol') != 2 or type(receipt.get('exit_code')) is not int
+            or receipt['exit_code'] != 0 or not str(receipt.get('reason', '')).startswith('completed')
+            or not isinstance(receipt.get('owner'), str) or not receipt['owner']
+            or not isinstance(receipt.get('job_id'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', receipt['job_id'])
+            or type(pid) is not int or not 0 < pid < 2**31
+            or type(finished) not in (int, float) or not math.isfinite(finished)
+            or not 0 < finished <= time.time()):
+        raise ValueError('terminal receipt is not a successful completed guard job')
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise ValueError('terminal owner identity cannot be inspected') from None
+    else:
+        raise ValueError('terminal owner is alive')
+
+    # A mounted build image must be bound to its physical artifact, never merely
+    # asserted to belong to it. Direct directory fixtures need no image mapping.
+    mount = None
+    image = None
+    if not scope.is_relative_to(artifact) or not source.is_relative_to(artifact):
+        image = Path(entry['image_path'])
+        mount = Path(entry['mountpoint'])
+        if (not plain(image) or not image.is_relative_to(artifact)
+                or image.suffix not in {'.sparseimage', '.sparsebundle'}
+                or not plain(mount) or not mount.is_mount()
+                or not scope.is_relative_to(mount) or not source.is_relative_to(mount)):
+            raise ValueError('terminal image mapping is invalid')
+        images = run(['hdiutil', 'info', '-plist'])
+        if images.returncode:
+            raise RuntimeError('cannot inspect terminal image mapping')
+        if not any(record.get('image-path') == str(image) and any(
+                entity.get('mount-point') == str(mount)
+                for entity in record.get('system-entities', []))
+                for record in plistlib.loads(images.stdout.encode())['images']):
+            raise ValueError('terminal image mapping changed')
+
+    if entry['kind'] == 'terminal-gradle-derived':
+        relative = path.relative_to(scope).parts
+        # Keep modules-2, distributions, native tools, credentials, journals,
+        # locks, test reports and original dependency archives untouched.
+        valid = (len(relative) == 2 and relative[0] == 'caches'
+                 and (relative[1] == 'build-cache-1' or re.fullmatch(r'jars-\d+', relative[1])))
+        valid = valid or (len(relative) == 3 and relative[0] == 'caches'
+                         and re.fullmatch(r'\d+(?:\.\d+){1,2}', relative[1])
+                         and relative[2] in {'transforms', 'kotlin-dsl', 'dependencies-accessors', 'generated-gradle-jars'})
+        if not valid:
+            raise ValueError('downloaded inputs are not derived outputs')
+        tag = scope / 'caches/CACHEDIR.TAG'
+        if (not plain(tag) or not tag.is_file() or tag.stat().st_uid != os.getuid()
+                or not tag.read_bytes().startswith(b'Signature: 8a477f597d28d172789f06886806bc55\n')):
+            raise ValueError('terminal Gradle cache marker is missing or invalid')
+    else:
+        relative = path.relative_to(source).parts
+        if scope != source or not (relative[-2:] == ('build', 'kotlin')
+                                   or relative[-3:] == ('build', 'klib', 'cache')):
+            raise ValueError('Konan compiler distributions and downloads are not derived outputs')
+
+    inputs = entry['rebuild_inputs']
+    if (not isinstance(inputs, dict) or 'gradlew' not in inputs
+            or 'gradle/wrapper/gradle-wrapper.properties' not in inputs
+            or not any(name in inputs for name in ('settings.gradle', 'settings.gradle.kts'))
+            or not any(name in inputs for name in ('build.gradle', 'build.gradle.kts'))):
+        raise ValueError('terminal rebuild recipe is incomplete')
+    for name, digest in inputs.items():
+        if not isinstance(name, str):
+            raise ValueError('terminal rebuild input name is invalid')
+        item = source / name
+        if (not plain(item) or not item.is_relative_to(source)
+                or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)
+                or not item.is_file() or item.stat().st_uid != os.getuid()
+                or hashlib.sha256(item.read_bytes()).hexdigest() != digest):
+            raise ValueError('terminal rebuild input changed')
+        selected = run(['git', '-C', str(source), 'ls-files', '--error-unmatch', '--', name])
+        if selected.returncode:
+            raise ValueError('terminal rebuild input is not tracked source')
+    # A present lock/verification manifest cannot be omitted from the review.
+    for name in ('gradle.lockfile', 'gradle/verification-metadata.xml', 'gradle/libs.versions.toml'):
+        if (source / name).exists() and name not in inputs:
+            raise ValueError('terminal rebuild lock input is missing from review')
+
+    registry = app_home / 'guard-reservations'
+    result_path = registry / (receipt['job_id'] + '.result')
+    if (not plain(result_path) or not result_path.is_file()
+            or result_path.stat().st_uid != os.getuid()):
+        raise ValueError('terminal guard result is missing or invalid')
+    result_bytes = result_path.read_bytes()
+    if hashlib.sha256(result_bytes).hexdigest() != entry['result_sha256']:
+        raise ValueError('terminal guard result changed')
+    result = json.loads(result_bytes)
+    if (not isinstance(result, dict) or result.get('owner') != receipt['owner']
+            or type(result.get('exit_code')) is not int or result['exit_code'] != 0
+            or not isinstance(result.get('command_hash'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', result['command_hash'])):
+        raise ValueError('terminal guard result does not confirm completion')
+    if registry.is_symlink():
+        raise ValueError('terminal guard registry is symlinked')
+    for record_path in registry.glob('*.json'):
+        if record_path.is_symlink():
+            raise ValueError('terminal guard record is symlinked')
+        record = json.loads(record_path.read_text())
+        if not isinstance(record, dict):
+            raise ValueError('terminal guard record is malformed')
+        if record.get('state') not in ('waiting', 'running'):
+            continue
+        target = record.get('artifact')
+        if not isinstance(target, str):
+            raise ValueError('terminal active consumer cannot be inspected')
+        target = Path(target)
+        if (target.is_relative_to(artifact) or artifact.is_relative_to(target)
+                or target.is_relative_to(scope) or scope.is_relative_to(target)
+                or (mount and any(v.get('path') == str(mount) for v in record.get('volumes', [])))):
+            raise ValueError('terminal output has active or waiting consumers')
+    protected = [scope, source, artifact] + ([mount] if mount else [])
+    for record in activity(records=True):
+        if any(used(root, [record['path']]) for root in protected):
+            if not storage_backend_handle(record, image):
+                raise ValueError('terminal scope has live consumers')
+    identity, newest, _ = inventory(path)
+    if list(identity) != entry['output_identity']:
+        raise ValueError('reviewed output identity changed')
+    if newest > finished:
+        raise ValueError('terminal output changed after completion')
+    for base, dirs, files in os.walk(path, followlinks=False):
+        if any((Path(base) / name).is_symlink() for name in dirs + files):
+            raise ValueError('terminal derived output contains a symlink')
+    if tracked(path, scope):
+        raise ValueError('terminal output contains tracked source')
+    fingerprint, newest_change_ns = terminal_snapshot(path, int(finished * 1000000000))
+    if newest_change_ns > int(finished * 1000000000):
+        raise ValueError('terminal output changed after completion (ctime_ns)')
+    reviewed_fingerprint = entry.get('output_fingerprint_sha256')
+    if reviewed_fingerprint is None:
+        if a.apply:
+            raise ValueError('terminal output fingerprint requires explicit review before apply')
+    elif (not isinstance(reviewed_fingerprint, str)
+          or not re.fullmatch(r'[0-9a-f]{64}', reviewed_fingerprint)
+          or reviewed_fingerprint != fingerprint):
+        raise ValueError('terminal reviewed output fingerprint changed')
+    terminal_fingerprints[str(path)] = fingerprint
+    return receipt_bytes, identity, newest
+
+
+def validate(entry):
+    path, scope = Path(entry['path']), Path(entry['scope'])
+    if not plain(path) or not plain(scope) or scope == Path('/'):
+        raise ValueError('noncanonical or symlinked artifact scope: ' + str(path))
+    if scope.exists() and (not scope.is_dir() or scope.stat().st_uid != os.getuid()):
+        raise ValueError('artifact scope is not an owned directory: ' + str(scope))
+    hours = float(entry.get('min_idle_hours', 24))
+    if hours < 24 or not hours < 87600:
+        raise ValueError('minimum idle time must be at least 24 hours')
+    kind = entry['kind']
+    valid = False
+    if kind in TERMINAL_KINDS:
+        terminal_context(entry)
+        valid = True
+    elif kind == 'node-dependencies':
+        valid = path == scope / 'node_modules' and (not scope.exists() or (scope / 'package.json').is_file())
+    elif kind == 'swift-output':
+        # Keep Swift dependency checkouts, repositories and package sources.
+        valid = (path.parent == scope / '.build' and
+                 path.name in ('arm64-apple-macosx', 'x86_64-apple-macosx',
+                               'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu', 'out') and
+                 (not scope.exists() or (scope / 'Package.swift').is_file()))
+    elif kind == 'xcode-derived':
+        valid = (path.parent == scope and (not scope.exists() or (scope / 'info.plist').is_file()) and
+                 path.name in ('Build', 'Index.noindex', 'ModuleCache.noindex',
+                               'CompilationCache.noindex', 'SDKExplicitPrecompiledModules',
+                               'SDKStatCaches.noindex'))
+    if not valid:
+        raise ValueError('unrecognized generated output: ' + str(path))
+    return path, scope, hours
+
+def activity(records=False):
+    # Include cwd, mapped binaries and open files; failure must preserve output.
+    result = run(['lsof', '-nP', '-a', '-u', str(os.getuid()), '-Fpcn'])
+    if result.returncode not in (0, 1) or (result.returncode == 1 and result.stderr.strip()):
+        raise RuntimeError('cannot inspect process use; outputs preserved: ' + result.stderr.strip())
+    entries = []
+    pid, command = None, None
+    for line in result.stdout.splitlines():
+        if line.startswith('p'):
+            pid, command = line[1:], None
+        elif line.startswith('c'):
+            command = line[1:]
+        elif line.startswith('n/'):
+            entries.append(dict(pid=pid, command=command, path=line[1:].removesuffix(' (deleted)')))
+    return entries if records else [entry['path'] for entry in entries]
+
+def used(scope, paths):
+    prefix = str(scope) + '/'
+    return any(path == str(scope) or path.startswith(prefix) for path in paths)
+
+def tracked(path, scope):
+    result = run(['git', '-C', str(scope), 'rev-parse', '--show-toplevel'])
+    if result.returncode:
+        if 'not a git repository' in result.stderr:
+            return False
+        raise RuntimeError('cannot inspect source ownership; outputs preserved')
+    repo = Path(result.stdout.strip())
+    relative = path.relative_to(repo)
+    result = run(['git', '-C', str(repo), 'ls-files', '-z', '--', str(relative)])
+    if result.returncode:
+        raise RuntimeError('cannot inspect tracked files; outputs preserved')
+    return bool(result.stdout)
+
+def inventory(path):
+    identity = path.lstat()
+    newest, allocated = identity.st_mtime, 0
+    def failed(error):
+        raise error
+    for base, dirs, files in os.walk(path, followlinks=False, onerror=failed):
+        for name in ['.'] + dirs + files:
+            item = (Path(base) / name).lstat()
+            newest = max(newest, item.st_mtime)
+            allocated += item.st_blocks * 512
+            if item.st_uid != os.getuid():
+                raise RuntimeError('mixed ownership; outputs preserved: ' + str(path))
+    return (identity.st_dev, identity.st_ino), newest, allocated
+
+try:
+    manifest = json.loads(a.manifest.read_text())
+    if manifest.get('version') != 1 or not isinstance(manifest.get('entries'), list):
+        raise ValueError('unsupported artifact manifest')
+    # Serialize terminal proof through the same mutex used by guard admission.
+    # This prevents a queued consumer from starting between the final checks
+    # and removal. Existing running work is never interrupted.
+    terminal_entries = [e for e in manifest['entries'] if e.get('kind') in TERMINAL_KINDS]
+    admission_handle = None
+    if terminal_entries:
+        if not plain(app_home):
+            raise ValueError('terminal mediator home must not be symlinked')
+        app_home.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(app_home / 'admission.lock', os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        admission_handle = os.fdopen(descriptor, 'a')
+        try:
+            fcntl.flock(admission_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('guard admission is active; terminal cleanup deferred')
+        targets = [Path(e['path']) for e in manifest['entries']]
+        for index, target in enumerate(targets):
+            if any(target.is_relative_to(other) or other.is_relative_to(target)
+                   for other in targets[index + 1:]):
+                raise ValueError('terminal review contains overlapping output paths')
+    # Validate the complete review before performing any destructive action.
+    entries = []
+    invalid = []
+    for entry in manifest['entries']:
+        try:entries.append(validate(entry))
+        except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as error:
+            invalid.append(dict(path=str(entry.get('path','unknown')),status='invalid',reason=str(error),allocated_bytes=0))
+    app_home.mkdir(parents=True, exist_ok=True)
+    with (app_home / 'reclaim.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('another artifact cleanup is active')
+        open_paths = activity()
+        report = list(invalid)
+        for path, scope, hours in entries:
+            item = dict(path=str(path), status='missing', allocated_bytes=0)
+            report.append(item)
+            if not path.exists():
+                continue
+            if not stat.S_ISDIR(path.lstat().st_mode):
+                raise ValueError('artifact is not an ordinary directory: ' + str(path))
+            if used(scope, open_paths):
+                item['status'] = 'active'
+                continue
+            if tracked(path, scope):
+                item['status'] = 'tracked-source'
+                continue
+            identity, newest, allocated = inventory(path)
+            item['allocated_bytes'] = allocated
+            entry = next(e for e in manifest['entries'] if e['path'] == str(path))
+            if entry['kind'] not in TERMINAL_KINDS and time.time() - newest < hours * 3600:
+                item['status'] = 'recent'
+                continue
+            item['status'] = 'eligible'
+            if entry['kind'] in TERMINAL_KINDS:
+                item['output_fingerprint_sha256'] = terminal_fingerprints[str(path)]
+                if 'output_fingerprint_sha256' not in entry:
+                    item['status'] = 'review-required'
+            if not a.apply:
+                continue
+            # Fresh checks immediately before removal. Never terminate a process.
+            validate(entry)
+            if used(scope, activity()):
+                item['status'] = 'active'
+                continue
+            fresh_identity, fresh_newest, _ = inventory(path)
+            if fresh_identity != identity or fresh_newest != newest:
+                item['status'] = 'changed'
+                continue
+            shutil.rmtree(path)
+            item['status'] = 'removed'
+        result = dict(applied=a.apply, completed_at=time.time(), entries=report,
+                      removed_allocated_bytes=sum(x['allocated_bytes'] for x in report
+                                                  if x['status'] == 'removed'))
+        if a.report:
+            temporary = a.report.with_name(a.report.name + '.' + str(os.getpid()))
+            temporary.write_text(json.dumps(result) + '\n')
+            temporary.replace(a.report)
+        print(json.dumps(result))
+        if invalid:sys.exit(1)
+except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+    print('ERROR: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 cmd_run() {
   local cron=""
   while [ $# -gt 0 ]; do case "$1" in --cron) cron=1 ;; --dry-run|-n) DRY=1 ;; *) err "unknown run flag: $1"; exit 1 ;; esac; shift; done
@@ -336,20 +1782,16 @@ cmd_run() {
   guard_paths
   local before; before="$(free_space)"
   run_body() {
+    local failures=0
     echo "=== $(date) ${DRY:+[dry-run] }run start (free: $before) ==="
     # 1. Rust artifacts
     if command -v cargo-sweep >/dev/null 2>&1; then
       if [ "$DRY" = 1 ]; then echo "would: cargo sweep -r --time $SWEEP_DAYS for $TARGET_DIR ${PROJECT_DIRS[*]}"
-      else cargo sweep -r --time "$SWEEP_DAYS" "$TARGET_DIR" "${PROJECT_DIRS[@]}" 2>&1 || true; fi
+      else cargo sweep -r --time "$SWEEP_DAYS" "$TARGET_DIR" "${PROJECT_DIRS[@]}" 2>&1 || { echo "ERROR: cargo sweep failed"; failures=$((failures + 1)); }; fi
     else echo "cargo-sweep missing; skipping sweep"; fi
-    # 2. stale node_modules
-    local d
-    for d in "${PROJECT_DIRS[@]}"; do
-      [ -d "$d" ] || continue
-      if [ "$DRY" = 1 ]; then
-        find "$d" -type d -name node_modules -prune -mtime +"$NM_DAYS" 2>/dev/null | while read -r nm; do echo "would remove node_modules ($(human "$nm")): $nm"; done
-      else find "$d" -type d -name node_modules -prune -mtime +"$NM_DAYS" -exec rm -rf {} + 2>&1 || true; fi
-    done
+    # Recover the authorized cache categories dynamically; no path approval inventory.
+    if [ "$DRY" = 1 ]; then cmd_recover --dry-run || failures=$((failures + 1))
+    else cmd_recover --apply || failures=$((failures + 1)); fi
     # 3. prune dangling worktree metadata
     local repo
     if [ "${#GIT_REPOS[@]}" -gt 0 ]; then printf '%s\n' "${GIT_REPOS[@]}"; else discover_git_repos; fi | sort -u | while read -r repo; do
@@ -357,28 +1799,42 @@ cmd_run() {
       if [ "$DRY" = 1 ]; then git -C "$repo" worktree prune --dry-run 2>&1 | sed "s|^|would prune ($repo): |"
       else git -C "$repo" worktree prune 2>&1 || true; fi
     done
-    # 4. stale agent worktree checkouts
-    for d in "${PROJECT_DIRS[@]}"; do
-      [ -d "$d" ] || continue
-      if [ "$DRY" = 1 ]; then
-        find "$d" -type d -path '*/.claude/worktrees/agent-*' -prune -mtime +"$WORKTREE_DAYS" 2>/dev/null | while read -r wt; do echo "would remove agent worktree ($(human "$wt")): $wt"; done
-      else find "$d" -type d -path '*/.claude/worktrees/agent-*' -prune -mtime +"$WORKTREE_DAYS" -exec rm -rf {} + 2>&1 || true; fi
-    done
+    # Source checkouts require explicit merged/abandoned review, never age-only removal.
+    echo "source worktrees preserved; retire reviewed checkouts with git worktree remove"
     # 5. prune pnpm store
     if command -v pnpm >/dev/null 2>&1; then
-      [ "$DRY" = 1 ] && echo "would: pnpm store prune" || pnpm store prune 2>&1 || true
+      if [ "$DRY" = 1 ]; then echo "would: pnpm store prune (working directory: $HOME)"
+      elif ! (cd "$HOME" && pnpm store prune) 2>&1; then
+        echo "ERROR: pnpm store prune failed"; failures=$((failures + 1))
+      fi
+    fi
+    if [ "$failures" -gt 0 ]; then
+      echo "=== $(date) cleanup incomplete: $failures failed step(s) (free: $(free_space)) ==="
+      return 1
     fi
     echo "=== $(date) run done (free: $(free_space)) ==="
   }
   mkdir -p "$(dirname "$LOG")"
   if [ "$cron" = 1 ]; then run_body >> "$LOG" 2>&1
-  else run_body 2>&1 | tee -a "$LOG"; echo; ok "${DRY:+[dry-run] }done — free: $before → $(free_space)"; fi
+  else
+    run_body 2>&1 | tee -a "$LOG"
+    local statuses=("${PIPESTATUS[@]}")
+    if [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; then
+      err "cleanup incomplete — inspect $LOG"; return 1
+    fi
+    echo; ok "${DRY:+[dry-run] }done — free: $before → $(free_space)"
+  fi
 }
 
 cmd_status() {
   printf '%s\n' "${c_bold}$APP_NAME v$APP_VERSION${c_0} ($OS)"
   printf '  free space (%s): %s\n' "$DATA_PATH" "${c_bold}$(free_space)${c_0}"
   if sched_loaded; then ok "scheduled job: active ($(weekday_name "$RUN_WEEKDAY") $(printf '%02d:%02d' "$RUN_HOUR" "$RUN_MINUTE"))"; else warn "scheduled job: not active"; fi
+  if [ "$OS" = Darwin ] && launchctl list "$APP_NAME-reclaim" >/dev/null 2>&1; then
+    ok "dynamic cache recovery: hourly"
+  elif [ -f "$APP_HOME/approved-artifacts.json" ]; then
+    warn "legacy manifest present; dynamic recovery schedule is not loaded"
+  fi
   if grep -q "$SENTINEL" "$HOME/.cargo/config.toml" 2>/dev/null; then ok "cargo shared target dir: $TARGET_DIR"; else warn "cargo shared target dir: not configured"; fi
   if grep -q "$SENTINEL" "$HOME/.npmrc" 2>/dev/null; then ok "pnpm linking: on ($NPM_IMPORT_METHOD)"; else warn "pnpm linking: off"; fi
   if command -v cargo-sweep >/dev/null 2>&1; then ok "cargo-sweep: $(cargo-sweep --version 2>/dev/null)"; else warn "cargo-sweep: missing"; fi
@@ -393,35 +1849,67 @@ cmd_config()  { say "$CONFIG_FILE"; [ -f "$CONFIG_FILE" ] && { echo; cat "$CONFI
 # portable in-place sed (BSD vs GNU)
 sed_i() { if sed --version >/dev/null 2>&1; then sed -i "$1" "$2"; else sed -i '' "$1" "$2"; fi; }
 
+cmd_jobs() {
+  local module; module="$(runtime_module jobs.py)" || return $?
+  python3 -B "$module" "$@"
+}
+
+runtime_directory() {
+  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent)' "$0"
+}
+
+runtime_module() {
+  local directory; directory="$(runtime_directory)" || return $?
+  if [ -f "$directory/$1" ]; then
+    printf '%s\n' "$directory/$1"
+  else
+    printf '%s\n' "$APP_HOME/$1"
+  fi
+}
+
+cmd_coverage() {
+  local module; module="$(runtime_module coverage.py)" || return $?
+  python3 -B "$module" "$@"
+}
+
 cmd_help() {
   cat <<EOF
-${c_bold}$APP_NAME${c_0} v$APP_VERSION — keep git worktrees from eating your disk.
+$APP_NAME v$APP_VERSION — submit work; scheduling and recovery are automatic.
 
-${c_bold}USAGE${c_0}
-  $APP_NAME <command> [flags]
+  $APP_NAME submit -- COMMAND       submit a new job; print its ID
+  $APP_NAME status [JOB] [--json]    inspect the queue or one job
+  $APP_NAME logs JOB [-f]           read or follow retained diagnostic output
+  $APP_NAME wait JOB                wait; return the command's exit status
+  $APP_NAME cancel JOB              request cancellation of your job
 
-${c_bold}COMMANDS${c_0}
-  install [--with-agent-guidance] [--dry-run]
-                     shared Cargo target dir + pnpm linking + weekly scheduled cleanup
-  uninstall [--purge]  reverse everything cleanly (--purge also removes cargo-sweep & state)
-  run [--dry-run|-n]   run the cleanup now (sweep artifacts, prune stale worktrees/node_modules)
-  status               show what's configured and current free space
-  logs [-f]            show (or follow) the run log
-  config               print the config file path + contents
-  version              print version
-  help                 this help
-
-Edit the config (see '$APP_NAME config') then re-run 'install' to change schedule/thresholds.
-Source code and agent chat history are never touched.
+No resource options or manual cleanup approvals are needed for ordinary jobs.
+Each submission is distinct. Inspect status after a lost receipt; do not blindly resubmit.
+Setup: $APP_NAME install. Existing maintenance/guard callers remain compatible.
+Full manual: man $APP_NAME
 EOF
 }
 
 case "${1:-help}" in
+  help|-h|--help|version|config|guidance) ;;
+  *) find_python || exit $? ;;
+esac
+case "${1:-help}" in
   install)   shift; cmd_install "$@" ;;
   uninstall) cmd_uninstall "${2:-}" ;;
   run)       shift; cmd_run "$@" ;;
-  status)    cmd_status ;;
-  logs)      cmd_logs "${2:-}" ;;
+  recover)   shift; cmd_recover "$@" ;;
+  reclaim)   shift; cmd_reclaim "$@" ;;
+  admit|guard) cmd_capacity "$@" ;;
+  guidance)  agents_block ;;
+  _coverage) shift; cmd_coverage "$@" ;;
+  submit|wait|cancel|jobs|show) command="$1"; shift; cmd_jobs "$command" "$@" ;;
+  status)    shift; cmd_jobs status "$@" ;;
+  logs)
+    case "${2:-}" in
+      j-*) shift; cmd_jobs logs "$@" ;;
+      -f|--follow) if [ -n "${3:-}" ]; then shift; cmd_jobs logs "$@"; else cmd_logs -f; fi ;;
+      *) cmd_logs "${2:-}" ;;
+    esac ;;
   config)    cmd_config ;;
   version)   say "$APP_NAME v$APP_VERSION" ;;
   help|-h|--help) cmd_help ;;

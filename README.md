@@ -1,131 +1,79 @@
 # disk-janitor
 
-[![CI](https://github.com/WillieCubed/disk-janitor/actions/workflows/ci.yml/badge.svg)](https://github.com/WillieCubed/disk-janitor/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
-
-Keeps git worktrees from quietly filling your disk. Every worktree builds its own Rust
-`target/` and installs its own `node_modules`, so a handful of them can waste hundreds of
-gigabytes on copies of the same files. disk-janitor sets up dependency sharing so that stops
-happening, and runs a weekly cleanup of the build junk that does pile up.
-
-It never touches your source code or your coding agent's chat history.
+Submit work. The tool owns admission, queueing, capacity recovery and teardown.
 
 ```sh
-brew install WillieCubed/tap/disk-janitor
-disk-janitor install        # set up sharing and schedule the weekly cleanup
-disk-janitor status         # show what's configured and how much space is free
-disk-janitor run --dry-run  # show what a cleanup would remove, without removing it
+job=$(disk-janitor submit -- pnpm test)
+disk-janitor wait "$job"
+disk-janitor logs "$job"
 ```
 
-## The problem
+No disk estimates, owner labels, output-root setup, reserve exceptions or restartability flags are required.
 
-Tools like Claude Code and Codex do their work in git worktrees. Worktrees share git history
-but not build output, so every worktree compiles its own copy of your dependencies into
-`target/` and installs its own `node_modules`. You don't notice until the disk is full.
+## Job commands
 
-disk-janitor fixes the cause instead of only cleaning up after it:
-
-- Points every project at one shared Cargo target directory, so dependencies compile once
-  instead of once per worktree.
-- Turns on pnpm's store linking, so a worktree's `node_modules` reuses files from the store
-  instead of copying them (`clone` on macOS/APFS, `hardlink` on Linux).
-- Schedules a weekly job that runs `cargo-sweep`, removes stale `node_modules`, prunes dead
-  git worktrees, and clears abandoned agent worktrees.
-
-Other tools clean build artifacts after the fact ([kondo](https://github.com/tbillington/kondo),
-[cargo-sweep](https://github.com/holmgr/cargo-sweep),
-[npkill](https://github.com/voidcosmos/npkill)). disk-janitor uses them, but its main job is to
-stop the duplication in the first place.
-
-## Install
-
-```sh
-brew install WillieCubed/tap/disk-janitor
-```
-
-Or from source:
-
-```sh
-git clone https://github.com/WillieCubed/disk-janitor
-cd disk-janitor
-./install.sh
-```
-
-`install.sh` copies the script to `~/.local/bin` and runs `disk-janitor install`. Make sure
-`~/.local/bin` is on your `PATH`.
-
-To also drop a short note into your agent config files (`~/.codex/AGENTS.md`,
-`~/.claude/CLAUDE.md`) telling agents not to undo the shared setup:
-
-```sh
-disk-janitor install --with-agent-guidance
-```
-
-## Commands
-
-| Command | What it does |
+| Command | Behavior |
 | --- | --- |
-| `install` | set up sharing and schedule the weekly cleanup |
-| `run` | run a cleanup now (`--dry-run` to preview) |
-| `status` | show configuration and free space |
-| `uninstall` | undo everything (`--purge` also removes cargo-sweep and saved state) |
-| `logs` | show the run log (`-f` to follow) |
-| `config` | print the config file path and contents |
+| `submit -- COMMAND [ARGS...]` | Durably accept one distinct invocation and print its job ID. The worker inherits the submitting execution permissions, environment and working directory. |
+| `status [JOB] [--json]` | List jobs and capacity, or inspect one outcome and its artifact path. |
+| `logs JOB [-f]` | Read or follow the last 256 KiB of diagnostic output. Explicit command artifacts are retained separately. |
+| `wait JOB` | Wait for terminal settlement and return its exit code. Interrupting the observer does not cancel work. |
+| `cancel JOB` | Ask the owning guardian to cancel a job. Agent clients cannot cancel another agent's job. |
 
-`install` also takes `--with-agent-guidance` and `--dry-run`.
+Every `submit` is new work, even if the command is identical. After losing a submit receipt, inspect `status` instead of blindly repeating the submission. A successful acceptance is not a successful command.
 
-## Configuration
+States are `queued`, `running`, `cancelling`, `succeeded`, `failed`, `cancelled`, and `unknown`. Unknown returns 125; cancelled returns 143. Other command exit codes are preserved, including known launch failures. Cancellation cannot undo external side effects that have already happened.
 
-`install` writes `~/.disk-janitor/config.env`. Edit it and run `install` again to apply.
+## Deterministic lifecycle
 
-```sh
-TARGET_DIR="$HOME/.cache/cargo-target"   # shared Cargo target directory
-PROJECT_DIRS=("$HOME/Projects")          # where to look for worktrees and builds
-NPM_IMPORT_METHOD="clone"                # clone (APFS), hardlink (Linux), or copy
-SWEEP_DAYS=10                            # remove cargo artifacts older than this
-NM_DAYS=30                               # remove node_modules untouched this long
-WORKTREE_DAYS=14                         # remove idle agent worktrees after this
-RUN_WEEKDAY=0; RUN_HOUR=3; RUN_MINUTE=0  # weekly schedule (0 is Sunday)
-```
+A private durable job record identifies each invocation. The existing guard remains the sole admission authority: there is no competing queue broker or privileged command-execution daemon. Permission-preserving workers submit to that shared state machine and retain the original execution context after the client exits. Stable backend IDs and held lifetime locks prevent a second worker or observer from replaying a running or uncertain job. Observers never execute stored commands.
 
-It refuses to run if `PROJECT_DIRS` points at your home directory or `/`.
+A job waits for one thing only: a free slot. The number of slots follows the machine, one per four cores and per 16 GiB of memory, whichever is fewer (`MAX_RUNNING` overrides it), so builds stay fast instead of oversubscribing the CPU. Waiting is first come, first served, and `status` shows each queued job's position and how many slots are busy. A slot is a kernel lock held by the running job and a place in the queue is a locked ticket, so a crashed job or a stale record can never occupy either. Commands that plainly run no build tool, such as `git push` or a short script, take no slot and start at once. A job still waiting after an hour fails with that reason, and `status` flags a running job that has produced no output for two hours.
 
-## Completions and man page
+Disk is decided at the moment a job has its slot. With at least the floor free (`FLOOR_GIB`, 5 GiB by default) it starts. Below the floor, one recovery pass of a few seconds runs, and the job then starts or fails with the numbers: how much is free, how much is needed and how much the pass freed. A job never waits for disk, and a missing required mount is likewise an immediate failure with its reason. Nothing else delays or refuses a start. Other jobs' records, retention measurement, a recovery in progress and busy locks are not consulted; state that would once have paused admission is written to `admission-notices.log` and ignored. Estimates are recorded for the job's owner and are not held against other jobs.
 
-Homebrew installs bash, zsh, and fish completions and a man page. After that:
+Arbitrary submitted commands are nonrestartable. A tool name does not prove a build or test is free of external side effects. Existing explicitly registered disposable legacy jobs retain bounded cooperative retry; that policy is not an agent-supplied option on the job API. The original worker can replace a failed guardian only before a durable execution commitment and after proving no live execution lease or outcome exists. Command completion is captured durably before frontend handoff; matching surviving completion evidence can resolve an earlier unknown without another launch. Losing all trusted execution/outcome evidence settles Unknown rather than inventing success or replaying side effects.
 
-```sh
-man disk-janitor
-disk-janitor <Tab>
-```
+Command/workspace observations are kept as bounded private hashes, not argument strings. Observed output and filesystem pressure can raise future estimates. Ordinary commands have no proven output confinement, so a small artifact directory does not justify reducing their write budget. Estimates remain predictions rather than OS-enforced quotas.
 
-The `install.sh` script sets these up too, on a best-effort basis, under `~/.local/share`.
+## Capacity recovery and outputs
 
-## What it never removes
+Recovery is demand-driven. A watchdog runs every minute and, when less than the low-water mark is free (`LOW_WATER_GIB`, 30 GiB by default), reclaims authorized inactive output until that much is free again, so a starting job rarely meets its floor. A job that does meet its floor asks for the same recovery with its own floor and a time limit. Recovery remeasures physical free space after each batch and stops when the demand is met; no cleanup runs above the low-water mark. It never waits for running jobs and no job waits for it: each unit is removed only on proof that nothing is using it. Source, uncommitted work, credentials, databases, active output and unique job artifacts are preserved.
 
-Your source code, and your agent chat history: `~/.claude/projects`, `~/.codex/sessions`, and
-the like. Only build artifacts and abandoned worktree checkouts get cleaned.
+The watchdog also retires reservation records whose guardian and process group are gone, after making their outcome durable, and it treats a job left waiting beside a free slot as a fault: the oldest waiter is told to start.
 
-## Platforms
+Gradle `build` output directories inside git checkouts are reclaimed when the checkout is idle. A directory qualifies when it is named `build`, sits beside a Gradle build script, is not under `src` or `node_modules`, and holds nothing git tracks or would add. The checkout is idle when no process has its working directory or an open file inside it and no live submitted job runs there. Checkouts are found from the repositories under `PROJECT_DIRS` and their `git worktree` lists, wherever those worktrees live. A directory holding a keystore, key or database file is left alone.
 
-Built and tested on macOS (Apple Silicon). Linux support (a systemd user timer or cron, plus
-hardlink dedup) is in place but less tested; reports and patches are welcome. Needs bash 3.2 or
-newer, git, and optionally cargo/cargo-sweep and pnpm.
+Automatic reclamation also covers inactive Cargo incremental output and positively identified generated dependency object/archive/metadata files in proven shared Cargo profiles, Gradle local task cache and marked transform build-cache entries, and standard Xcode DerivedData. Exported binaries, root libraries and unmarked locations are preserved. Dependency downloads, disk images, source worktrees and other retained environments are excluded. Managed artifacts are exposed as `DISK_JANITOR_ARTIFACT_ROOT` and retained after completion; do not put unique deliverables into a disposable compiler cache. Existing shared Cargo output and pnpm clone linking remain in use.
 
-## Troubleshooting
+Activity detection inspects actual executable identity and structured Java entrypoints; a queued guardian mentioning a future compiler is not a running compiler. Validated cache units are removed in bounded native batches, with fresh process/open-file and identity checks, per-batch pressure sampling and measured filesystem free-space reports. Protected content in one unit does not prevent unrelated eligible units from being reclaimed. Allocation totals are estimates; `filesystems` reports actual before/after availability, including concurrent writes and shared/clone storage effects.
 
-After `brew upgrade disk-janitor`, run `disk-janitor install` once. The scheduled job runs a copy
-of the script under `~/.disk-janitor`, and re-running install refreshes that copy.
+The full weekly cleanup still requires that no job is running and skips itself otherwise. The tool does not kill protected work or delete user data to make room; when room cannot be made, the job that needed it fails with the numbers.
 
-If Login Items lists a leftover "bash" entry, it's from an older version that scheduled the job as
-`/bin/bash`. Current versions run the script directly, so you can remove the old entry.
+A live controller outside the owned command group monitors required filesystem reserves. On supported Linux systems it can pause that group under pressure, request authorized recovery, and resume the same processes after capacity returns. A native parent-death continuation prevents loss of the controller from stranding stopped work. Darwin monitors pressure without stopping nonrestartable work because it lacks that safe orphan-thaw mechanism. Status distinguishes pressure observation from pressure blocking, with its reason and start time. Cancellation observes the cache fence before resuming stopped processes for teardown. This is sampled cooperative protection: other writers, escaped descendants and stop latency can exceed a reserve. Loss of all safe live control evidence cannot authorize signalling a recycled PID, command replay or deletion of active output.
 
-## How the schedule works
+## Integration and setup
 
-macOS uses a launchd agent at `~/Library/LaunchAgents/disk-janitor.plist`. Linux uses a systemd
-user timer, or a crontab entry if systemd isn't available.
+Run `./install.sh --with-agent-guidance` once. Runtime components are Python standard library, the existing Bash guard, and standard OS tools used for activity inspection. Normal agents use the five job commands; they do not manipulate private records, locks or scheduler policy.
 
-## License
+Runtime installation stages a complete content-addressed release, verifies its ownership and checksums, and activates it with one atomic `current` symlink change. Previous releases and backups of the former installed regular files are retained. CLI/helper aliases share that pointer; shims resolve it once before executing a helper so later upgrades do not mix imported runtime modules. Redirected or modified installation state stops the update before activation.
 
-[MIT](LICENSE).
+Runtime releases are retained immutably and activated through one current-release pointer. A stable dispatcher resolves that pointer once and executes the complete physical release. Existing workers keep their original release; rollback does not reconstruct or repeat commands.
+
+The installer creates scoped executable shims and adds a reversible PATH block to zsh and bash startup files. New shells automatically manage noninteractive `cargo`, `rustc`, `gradle`, `gradlew`, `xcodebuild`, `swift`, `swiftc`, `pnpm`, `npm`, `yarn`, `bun`, `make`, `gmake`, `cmake`, `ninja`, `pytest`, `py.test`, `tsc`, `vitest` and `jest` invocations. The shims preserve command arguments, working directory, environment, stdin, separate stdout/stderr and exit status through synchronous guard execution. Bare invocations appear in public job status and wait; their streams are delivered to the original caller and are not retained by logs. They retain artifacts in `DISK_JANITOR_ARTIFACT_ROOT`; detached submissions retain the normal bounded diagnostic log. No shell function, pre-execution trap, privileged executor or Python/shell override is installed.
+
+A nested shim joins only its actual live managed process group, verified against a held owned guard lease and the runtime's bound private process-group record. An environment variable alone cannot authorize execution without admission. Work started by an external broker that shares admission through the [provider protocol](docs/admission-protocol.md) is marked with `DISK_JANITOR_BROKER` and is rejected instead of creating a second reservation; brokers whose writes do not traverse host tool shims, such as VM hosts, account for their own work through that protocol.
+
+Terminal invocations pass directly to the original executable, preserving its controlling terminal and job control without claiming a managed reservation. Use detached submission for noninteractive workflows. PATH coverage applies in new shells after installation. Already running shells, explicit executable paths such as `./gradlew` or `/usr/bin/xcodebuild`, aliases/functions that select another executable, direct interpreter entrypoints and environments that replace PATH can bypass executable lookup. Use the normal `submit -- COMMAND` boundary for those workflows; the installer does not rewrite source launchers or override the shell. Noninteractive Bash only inherits its caller's PATH; zsh reads the managed `.zshenv` block. Uninstall removes only the managed blocks and generated shims, preserving later user edits and original startup-file backups. Symlinked startup files are preserved and stop shell setup before it writes startup files.
+
+Existing `run` cleanup, `guard`, `admit`, `recover` and `reclaim` callers remain compatible during migration, but are not the normal agent interface.
+
+The worker preserves the original sandbox/approval context. It does not reconstruct work under a more privileged daemon after a worker loss. A surviving owned guardian can still finish and publish its receipt; total executor/evidence loss becomes Unknown. Private state is not a security boundary against another process with the same OS user's unrestricted filesystem privileges.
+
+## Verification
+
+Run `python3 -m unittest discover -s tests -v`, `bash tests/run.sh`, and `shellcheck bin/disk-janitor install.sh`. Tests use disposable homes and real tiny child processes, including lost workers/guardians, cancellation, concurrency, inherited sandbox restrictions and pressure recovery.
+
+`formal/Jobs.tla` specifies protocol safety and conditional liveness. TLC checks finite configurations and deliberate unsafe mutations; `formal/README.md` records exact bounds, assumptions, state counts and limits. These are bounded model checks plus runtime conformance tests, not an unbounded proof, a complete implementation refinement proof, or exactly-once external effects. Java/TLC are verification-only dependencies, not runtime requirements.
+
+Source code is licensed under MIT; see LICENSE.
