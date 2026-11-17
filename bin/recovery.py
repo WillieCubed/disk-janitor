@@ -373,7 +373,11 @@ def worktrees(home):
 
 
 def _build_outputs(checkout, deadline=None):
-    """Topmost Gradle `build` directories of one checkout, each beside a Gradle build script."""
+    """Generated build directories of one checkout, each beside the build file that owns it.
+
+    Gradle `build` beside a Gradle build script, and Next.js `.next` and Turborepo `.turbo`
+    beside a package.json. The source guard still proves each one is ignored by git.
+    """
     for directory, names, files in os.walk(checkout, followlinks=False):
         if deadline is not None and time.monotonic() >= deadline:
             return
@@ -382,6 +386,10 @@ def _build_outputs(checkout, deadline=None):
             continue
         if 'build' in names and not GRADLE_SCRIPTS.isdisjoint(files):
             yield Path(directory) / 'build'
+        if 'package.json' in files:
+            for generated in ('.next', '.turbo'):
+                if generated in names:
+                    yield Path(directory) / generated
         names[:] = sorted(name for name in names
                           if name not in ('build', 'src', 'node_modules') and not name.startswith('.'))
 

@@ -180,7 +180,13 @@ process group rather than launching escaped writers.
 .PP
 Automatic pressure recovery covers inactive Cargo incremental output and proven
 generated dependency objects in shared Cargo profiles, Gradle task/transform
-build caches and Xcode DerivedData. Exported binaries, root libraries and
+build caches, Xcode DerivedData, and the git-ignored Gradle
+.IR build ,
+Next.js
+.I .next
+and Turborepo
+.I .turbo
+directories of checkouts nobody is using. Exported binaries, root libraries and
 unmarked locations are preserved. Source, uncommitted
 work,
 credentials, databases, active outputs, disk images and unique artifacts

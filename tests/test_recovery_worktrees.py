@@ -83,6 +83,28 @@ class WorktreeBuildTests(Fixture):
         self.assertTrue((repo / 'feature/build.gradle.kts').exists())
         self.assertEqual(subprocess.run(['git', '-C', str(repo), 'status', '--porcelain'], capture_output=True, text=True).stdout, '')
 
+    def test_next_and_turbo_outputs_beside_package_json_are_removed(self):
+        repo = self.repository()
+        app = repo / 'apps/web'
+        app.mkdir(parents=True)
+        (app / 'package.json').write_text('{}')
+        (repo / 'package.json').write_text('{}')
+        (repo / '.gitignore').write_text('build/\n!tools/build/\n.next/\n.turbo/\n')
+        self.git(repo, 'add', '-A')
+        self.git(repo, 'commit', '-q', '-m', 'node packages')
+        generated = [app / '.next/cache/webpack/chunk.pack', app / '.turbo/turbo-build.log', repo / '.turbo/cache/a.tar.zst']
+        for path in generated:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('generated')
+        loose = repo / 'docs/.next/page.html'  # no package.json beside it
+        loose.parent.mkdir(parents=True)
+        loose.write_text('kept')
+        report = self.recover()
+        for path in generated:
+            self.assertFalse(path.exists(), path)
+        self.assertTrue(loose.exists())
+        self.assertEqual(report['counts'].get('worktree-build:removed'), 3)
+
     def test_uncommitted_files_credentials_and_databases_keep_their_directory(self):
         repo = self.repository()
         (repo / 'tools/build/draft.sh').write_text('not committed, not ignored')
