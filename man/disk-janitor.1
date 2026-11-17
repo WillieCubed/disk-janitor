@@ -81,6 +81,13 @@ result. An agent may cancel only its own jobs. The local human user may
 administer
 jobs. Cancellation does not undo external effects.
 .TP
+.B space \fR[\fB--json\fR]
+Show where disk space goes, changing nothing: agent worktrees grouped by state
+and by the folder each tool keeps them in, the worktrees the next recovery pass
+will retire, the build caches recovery reclaims, and the output files of launchd
+agents with those over the log cap. Sizes are measured, so the report can take
+a few minutes on a machine with many worktrees.
+.TP
 .B help\fR, \fB--help\fR, \fB-h
 Print a short command summary. Use
 .B man disk-janitor
@@ -180,6 +187,23 @@ credentials, databases, active outputs, disk images and unique artifacts
 remain
 protected. No manually approved path list is required for these categories.
 .PP
+Every recovery pass also retires finished linked worktrees of the repositories
+under the project directories, wherever a tool created them. Work is finished
+when the worktree's HEAD is in the remote default branch, its branch was
+deleted upstream, or its combined change was squash-merged. A worktree is kept
+while it has uncommitted or untracked files, is locked with
+.BR "git worktree lock" ,
+has a process or live job inside it, or was touched in the last 48 hours.
+Removal uses
+.B git worktree remove
+after the same checks are repeated, and the branch stays in the repository.
+.PP
+Each pass also caps the output files named by the user's launchd agents
+(StandardOutPath and StandardErrorPath), which launchd appends to without
+rotation. A file over the cap keeps its last 8 MiB in
+.I file.1
+and is emptied in place, so the service keeps writing without a restart.
+.PP
 The installer adds reversible PATH blocks for new zsh and bash shells and
 scoped build-tool wrappers. Noninteractive cargo, Gradle, Xcode, Swift,
 package-manager,
@@ -240,6 +264,14 @@ unset.
 .B DISK_JANITOR_ARTIFACT_ROOT
 Set by the runtime for the submitted command; do not supply an output-root
 option.
+.TP
+.B DISK_JANITOR_PROJECT_DIRS
+Colon-separated directories whose repositories recovery inspects for build
+output and finished worktrees; defaults to $HOME/Projects.
+.TP
+.B DISK_JANITOR_LOG_CAP_MB
+Size in MiB above which a launchd agent's output file is capped; defaults to
+256, minimum 16.
 .TP
 .B CODEX_THREAD_ID, CLAUDE_SESSION_ID
 Agent identity used to restrict cancellation to owned jobs.

@@ -632,6 +632,87 @@ def _cap_service_logs(home, report, note, *, apply, demand=None):
             note(entry, 'preserved', error)
 
 
+CACHE_ROOTS = (('Cargo build output', '.cache/cargo-target'), ('Gradle caches', '.gradle/caches'),
+               ('Xcode DerivedData', 'Library/Developer/Xcode/DerivedData'), ('pnpm store', 'Library/pnpm/store'),
+               ('npm cache', '.npm'))
+
+
+def _worktree_folder(checkout, home):
+    """The folder a tool keeps its worktrees in: up to the first path part naming worktrees."""
+    parts = checkout.parts
+    for index, part in enumerate(parts[:-1]):
+        if 'worktree' in part.lower():
+            return Path(*parts[:index + 1])
+    return checkout.parent
+
+
+def space(home, observer=activity):
+    """Where disk-janitor's categories stand: worktrees by state and folder, caches, service logs."""
+    home = Path(home).resolve()
+    usage = shutil.disk_usage(home)
+    view = _OpenPaths(list(observer()[1]), home)
+    states, folders, ready = {}, {}, []
+    for checkout in worktrees(home):
+        if _linked_git_dir(checkout) is None:
+            continue
+        size = _allocated(checkout)
+        try:
+            if view.occupied(checkout):
+                raise ValueError('in use')
+            _, why = retirement(checkout)
+            state = 'ready to retire'
+            ready.append(dict(path=str(checkout), finished=why, bytes=size))
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as kept:
+            state = str(kept)
+        count, total = states.get(state, (0, 0))
+        states[state] = (count + 1, total + size)
+        folder = str(_worktree_folder(checkout, home))
+        count, total = folders.get(folder, (0, 0))
+        folders[folder] = (count + 1, total + size)
+    caches = {label: _allocated(home / relative) for label, relative in CACHE_ROOTS if (home / relative).is_dir()}
+    cap = _log_cap_bytes()
+    logs = [dict(path=str(p), bytes=p.lstat().st_blocks * 512, over_cap=p.lstat().st_size > cap)
+            for p in service_logs(home)]
+    return dict(free=usage.free, total=usage.total, log_cap=cap,
+                worktrees=dict(states={k: dict(count=c, bytes=b) for k, (c, b) in states.items()},
+                               folders={k: dict(count=c, bytes=b) for k, (c, b) in folders.items()},
+                               ready=ready),
+                caches=caches, service_logs=logs)
+
+
+def _render_space(result, home):
+    gb = lambda n: f'{n / 1024 ** 3:6.1f} GB'
+    tilde = lambda p: p.replace(str(home), '~', 1)
+    used = result['total'] - result['free']
+    lines = [f"{gb(result['free']).strip()} free of {gb(result['total']).strip()} "
+             f"({100 * used // result['total']}% used)", '']
+    tree = result['worktrees']
+    count = sum(v['count'] for v in tree['states'].values())
+    total = sum(v['bytes'] for v in tree['states'].values())
+    lines.append(f'Agent worktrees  {count} checkouts  {gb(total)}')
+    order = ['ready to retire', 'uncommitted work preserved', 'work not merged', 'recently active', 'in use']
+    for state in sorted(tree['states'], key=lambda s: (order.index(s) if s in order else len(order), s)):
+        v = tree['states'][state]
+        lines.append(f"  {state:<30}{v['count']:>4}  {gb(v['bytes'])}")
+    lines.append('  by folder:')
+    for folder, v in sorted(tree['folders'].items(), key=lambda kv: -kv[1]['bytes'])[:8]:
+        lines.append(f"    {tilde(folder):<52}{v['count']:>4}  {gb(v['bytes'])}")
+    if tree['ready']:
+        lines.append('  the next recovery pass retires:')
+        for item in sorted(tree['ready'], key=lambda i: -i['bytes']):
+            lines.append(f"    {tilde(item['path'])}  {gb(item['bytes']).strip()}  ({item['finished']})")
+    lines += ['', 'Build caches (reclaimed when idle)']
+    for label, size in result['caches'].items():
+        lines.append(f'  {label:<30}      {gb(size)}')
+    logs = result['service_logs']
+    over = [log for log in logs if log['over_cap']]
+    lines += ['', f"Service logs  {len(logs)} files  {gb(sum(log['bytes'] for log in logs))}  "
+              f"(cap {result['log_cap'] // 1024 ** 2} MB, {len(over)} over)"]
+    for log in sorted(over, key=lambda log: -log['bytes']):
+        lines.append(f"  {tilde(log['path'])}  {gb(log['bytes']).strip()}")
+    return '\n'.join(lines)
+
+
 def candidates(home, occupied=None, deadline=None):
     # Outputs of checkouts nobody occupies go first: shared caches still serve active work.
     for discover in (lambda root: _worktree_candidates(root, occupied, deadline),
@@ -1294,9 +1375,15 @@ def main():
     parser.add_argument('--need', action='append', default=[], metavar='MOUNT=BYTES', help=argparse.SUPPRESS)
     parser.add_argument('--time-limit', type=float, help=argparse.SUPPRESS)
     parser.add_argument('--watchdog', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--space', action='store_true', help='report where disk space goes; changes nothing')
+    parser.add_argument('--json', action='store_true', help='with --space, print JSON')
     args = parser.parse_args()
     home = Path.home()
     app_home = Path(os.environ.get('DISK_JANITOR_HOME', str(home / '.disk-janitor')))
+    if args.space:
+        result = space(home)
+        print(json.dumps(result) if args.json else _render_space(result, home))
+        return
     if args.watchdog:
         result = watchdog(home, app_home)
         destination = app_home / 'watchdog-last.json'

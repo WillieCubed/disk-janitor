@@ -116,6 +116,20 @@ class WorktreeRetirementTests(unittest.TestCase):
         self.assertEqual(self.statuses(report)[str(occupied)], 'active')
         self.assertEqual(report['worktrees_kept'], 4)
 
+    def test_space_report_groups_worktrees_by_state_and_folder(self):
+        ready = self.worktree('ready', 'feature/ready')
+        dirty = self.worktree('dirty', 'feature/dirty')
+        (dirty / 'notes.txt').write_text('work')
+        result = self.recovery.space(self.home, observer=lambda: ([], []))
+        states = result['worktrees']['states']
+        self.assertEqual(states['ready to retire']['count'], 1)
+        self.assertEqual(states['uncommitted work preserved']['count'], 1)
+        self.assertEqual([r['path'] for r in result['worktrees']['ready']], [str(ready)])
+        self.assertEqual(result['worktrees']['folders'][str(self.home / 'agents')]['count'], 2)
+        self.assertTrue(ready.exists(), 'the report changes nothing')
+        text = self.recovery._render_space(result, self.home)
+        self.assertIn('ready to retire', text)
+
     def test_main_checkout_is_never_retired(self):
         self.recover()
         self.assertTrue((self.repo / 'README').exists())
