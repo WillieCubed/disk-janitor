@@ -7,7 +7,7 @@ Thanks for your interest! disk-janitor is intentionally small — one bash scrip
 - **POSIX-ish bash, 3.2 compatible.** It must run on stock macOS `/bin/bash` (3.2). No associative
   arrays, no `${var@Q}`, no `mapfile`/`readarray`.
 - **`shellcheck` clean.** Run `shellcheck bin/disk-janitor install.sh` before sending a PR.
-- **Never delete user data.** Only regenerable build artifacts and abandoned worktree *checkouts*.
+- **Never delete user data.** Only regenerable, reviewed build artifacts are eligible.
   Source code and agent chat history (`~/.claude/projects`, `~/.codex/sessions`, …) are off-limits.
 - **Every destructive path must be previewable** via `--dry-run`.
 

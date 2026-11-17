@@ -1,21 +1,21 @@
-# bash completion for disk-janitor
+# bash completion for the normal job API
 # shellcheck shell=bash disable=SC2207
 _disk_janitor() {
-  local cur cmds
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  cmds="install uninstall run status logs config version help"
-
+  local cur="${COMP_WORDS[COMP_CWORD]}"
   if [ "$COMP_CWORD" -eq 1 ]; then
-    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
-    return
+    COMPREPLY=( $(compgen -W 'submit status logs wait cancel help version' -- "$cur") )
+  elif [ "${COMP_WORDS[1]}" = submit ]; then
+    COMPREPLY=( $(compgen -c -- "$cur") )
+  elif [ "${COMP_WORDS[1]}" = status ] && [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W --json -- "$cur") )
+  elif [ "${COMP_WORDS[1]}" = logs ] && [[ "$cur" == -* ]]; then
+    COMPREPLY=( $(compgen -W '-f --follow' -- "$cur") )
+  else
+    local p ids=''
+    for p in "${DISK_JANITOR_HOME:-$HOME/.disk-janitor}"/jobs/j-*; do
+      [ ! -d "$p" ] || ids="$ids ${p##*/}"
+    done
+    COMPREPLY=( $(compgen -W "$ids" -- "$cur") )
   fi
-
-  case "${COMP_WORDS[1]}" in
-    install)   COMPREPLY=( $(compgen -W "--with-agent-guidance --dry-run" -- "$cur") ) ;;
-    uninstall) COMPREPLY=( $(compgen -W "--purge" -- "$cur") ) ;;
-    run)       COMPREPLY=( $(compgen -W "--dry-run -n" -- "$cur") ) ;;
-    logs)      COMPREPLY=( $(compgen -W "-f" -- "$cur") ) ;;
-    *)         COMPREPLY=() ;;
-  esac
 }
 complete -F _disk_janitor disk-janitor

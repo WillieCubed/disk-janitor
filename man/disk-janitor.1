@@ -1,143 +1,301 @@
-.TH DISK-JANITOR 1 "2026-06-25" "disk-janitor 0.1.4" "User Commands"
+.TH DISK-JANITOR 1 "2026-11-06" "disk-janitor 0.3.0-lifecycle" "User Commands"
 .SH NAME
-disk-janitor \- stop git worktrees from duplicating build artifacts and sweep regenerable junk on a schedule
+disk-janitor \- submit local jobs with automatic scheduling and disk recovery
 .SH SYNOPSIS
-.B disk-janitor
+.B disk-janitor submit --
 .I command
-.RI [ flags ]
-.SH DESCRIPTION
-AI coding agents (Claude Code, Codex, \[char46]\[char46]\[char46]) isolate work in git worktrees.
-Worktrees share git history but not build outputs, so each one gets its own multi-gigabyte
-.B target/
-and
-.BR node_modules .
+.RI [ argument ...]
+.br
+.B disk-janitor status
+.RI [ job ]
+.RB [ --json ]
+.br
+.B disk-janitor logs
+.I job
+.RB [ -f | --follow ]
+.br
+.B disk-janitor wait
+.I job
+.br
+.B disk-janitor cancel
+.I job
+.br
 .B disk-janitor
-prevents the duplication at the source and sweeps the regenerable remainder on a weekly schedule.
+.RB { help | --help | -h | version }
+.SH DESCRIPTION
+.B disk-janitor
+accepts a command and returns a durable job ID. Deterministic machinery
+chooses
+resource estimates, queues work, admits fitting jobs concurrently, and
+performs
+authorized reclamation under capacity pressure. Agents submit and observe
+jobs;
+no resource estimates, owner labels, storage-root setup or restart options are
+required in the public job interface.
 .PP
-It configures a shared Cargo target directory, enables pnpm store linking
-.RB ( clone
-on APFS,
-.B hardlink
-on Linux), and schedules a job that runs
-.BR cargo-sweep ,
-prunes stale
-.BR node_modules ,
-prunes dangling git worktree metadata, and removes idle
-.B **/.claude/worktrees/agent-*
-checkouts.
-.PP
-Source code and AI-agent chat history are never touched.
+Every submission is a new invocation, including identical commands. Acceptance
+means queued work, not command completion. After a lost submission response,
+inspect the queue before submitting again. Observing a job never starts or
+replays its stored command.
 .SH COMMANDS
 .TP
-.B install \fR[\fB--with-agent-guidance\fR] [\fB--dry-run\fR]
-Configure the shared Cargo target dir and pnpm linking, install
-.B cargo-sweep
-if needed, place the CLI on
-.BR PATH ,
-and schedule the weekly cleanup.
+.B submit -- \fIcommand\fR [\fIargument\fR ...]
+Submit a new job and print its ID to standard output. The double dash is
+required.
+The command is executed directly, without an implicit shell. For pipelines,
+redirections or multiple commands, explicitly submit a shell command.
+The job retains the submitting environment, working directory and execution
+permissions. Standard input is closed; stdout and stderr become retained job
+logs.
+The job can continue after the submitting client exits.
 .TP
-.B uninstall \fR[\fB--purge\fR]
-Reverse everything cleanly, restoring any pre-existing config files from backups.
-.B --purge
-also removes
-.B cargo-sweep
-and the application state directory.
+.B status \fR[\fIjob\fR] [\fB--json\fR]
+Show one job or list durable public jobs. Without a job, text output also
+reports
+internal free space. JSON output is an object for one job and an array for the
+queue. It includes identity, state, exit code, working directory, artifact
+root
+and executor information. Automatically managed foreground builds also appear.
+Pressure-paused execution includes pressure_blocked, reason and blocked_since.
+Historical legacy guard records are not listed.
 .TP
-.B run \fR[\fB--dry-run\fR|\fB-n\fR]
-Run the cleanup now.
-.B --dry-run
-reports what would be removed and deletes nothing.
+.B logs \fIjob\fR [\fB-f\fR | \fB--follow\fR]
+Print the retained diagnostic tail. With follow, stream updates until the job
+is
+terminal. At most the last 256 KiB is retained; expired output is unavailable.
+Interrupting the observer does not cancel the job.
+Foreground build wrappers preserve the caller's separate streams and do not
+retain them; logs explains that mode instead of manufacturing missing output.
 .TP
-.B status
-Show what is configured and the current free space.
+.B wait \fIjob\fR
+Wait for a terminal outcome, print its ID and state, and return its exit
+status.
+There is no default waiting deadline. Interrupting wait leaves the job running
+or queued.
 .TP
-.B logs \fR[\fB-f\fR]
-Show (or with
-.BR -f ,
-follow) the run log.
+.B cancel \fIjob\fR
+Request cancellation and print the current state. This returns after
+requesting
+cancellation, not necessarily after teardown; use wait to observe its terminal
+result. An agent may cancel only its own jobs. The local human user may
+administer
+jobs. Cancellation does not undo external effects.
 .TP
-.B config
-Print the configuration file path and its contents.
+.B help\fR, \fB--help\fR, \fB-h
+Print a short command summary. Use
+.B man disk-janitor
+for this full manual.
 .TP
 .B version
-Print the version.
-.TP
-.B help
-Show usage.
-.SH OPTIONS
-.TP
-.B --with-agent-guidance
-On
-.BR install ,
-manage a short worktree-guidance block in agent config files
-.RB ( ~/.codex/AGENTS.md ,
-.BR ~/.claude/CLAUDE.md )
-when they exist. Off by default.
-.TP
-.B --dry-run \fR(\fB-n\fR)
-Preview destructive actions without performing them.
-.TP
-.B --purge
-On
-.BR uninstall ,
-also remove
-.B cargo-sweep
+Print the installed version.
+.SH JOB STATES
+Nonterminal states are
+.BR queued ,
+.B running
 and
-.BR ~/.disk-janitor .
-.SH CONFIGURATION
-.B install
-writes
-.BR ~/.disk-janitor/config.env .
-Edit it and re-run
-.B install
-to apply. Key settings:
-.BR TARGET_DIR ,
-.BR PROJECT_DIRS ,
-.BR NPM_IMPORT_METHOD ,
-.BR SWEEP_DAYS ,
-.BR NM_DAYS ,
-.BR WORKTREE_DAYS ,
-.BR RUN_WEEKDAY / RUN_HOUR / RUN_MINUTE ,
+.BR cancelling .
+Terminal states are
+.BR succeeded ,
+.BR failed ,
+.B cancelled
 and
-.BR AGENT_GUIDANCE .
-.B disk-janitor
-refuses to operate if
-.B PROJECT_DIRS
-points at
-.B $HOME
-or
-.BR / .
+.BR unknown .
+.PP
+Ordinary public jobs are nonrestartable. A surviving owned executor may
+complete
+after a frontend or guardian failure. The original worker may replace a failed
+prelaunch guardian only when execution was not committed and no live execution
+lease or result exists. Matching durable command completion evidence can resolve
+a previously unknown outcome without another launch. If execution outcome
+proof is lost, the
+job settles as unknown; it is never automatically replayed or reported
+successful.
+There is no exactly-once guarantee for arbitrary external effects.
+.SH DEFAULTS
+Policy is automatic. Current per-command disk and memory estimates, in GiB,
+are:
+.TP
+.B true, false, echo, printf
+0.05 disk; 0.125 memory.
+.TP
+.B pytest, py.test, python* -m unittest
+1 disk; 2 memory.
+.TP
+.B cargo, gradle, gradlew, xcodebuild, swift, swiftc, rustc
+4 disk; 8 memory.
+.TP
+.B Other commands, including shell workflows
+2 disk; 2 memory.
+.PP
+Private hashed command/workspace observations can raise future estimates.
+Ordinary command budgets are not reduced merely because managed artifacts are
+small; scripts may write elsewhere. These are estimates, not kernel-enforced
+write quotas and are not held against other jobs.
+.PP
+A job waits only for a free slot. There is one slot per four cores and per
+16 GiB of memory, whichever is fewer; MAX_RUNNING in the config file overrides
+it. Waiting is first come, first served, and status shows the position. Slots
+and queue places are kernel locks, so a crashed job or stale record holds
+neither. Commands that plainly run no build tool take no slot. A job still
+waiting after an hour fails with that reason.
+.PP
+Disk is decided once the slot is held. With the floor free (FLOOR_GIB, default
+5) the job starts. Below it one recovery pass of a few seconds runs, then the
+job starts or fails stating the free space, the need and what was recovered.
+An external working-directory mount or an explicit /Volumes path argument is a
+required mount with a 1 GiB floor; a missing one fails the job at once.
+Other jobs' records, retention inventory, a running recovery and busy locks
+never delay a start; what was ignored is logged in admission-notices.log.
+Scripts' hidden output paths cannot be inferred automatically.
+.PP
+A watchdog runs every minute. Below the low-water mark (LOW_WATER_GIB, default
+30) it recovers idle caches and the Gradle build outputs of idle git checkouts.
+It retires reservation records nobody owns and starts the oldest waiter if one
+is left beside a free slot.
+A controller outside the owned command group samples required filesystem
+reserves. Supported Linux systems can pause that group, request authorized
+reclamation and resume the same processes after capacity returns; parent-death
+continuation prevents a lost controller from stranding stopped work. Darwin
+observes pressure without stopping arbitrary nonrestartable jobs. Status
+distinguishes pressure observation and blocking. Sampling latency, escaped
+writers and unrelated applications prevent
+a hard quota guarantee. Nonrestartable jobs are never automatically replayed
+or terminated merely to manufacture progress. Loss of all safe live control
+evidence can prevent recovery; persisted PIDs alone never authorize signalling.
+.SH OUTPUT AND SAFETY
+The job environment contains
+.B DISK_JANITOR_ARTIFACT_ROOT
+naming its private managed artifact directory. Keep unique outputs there or in
+appropriate source-owned locations. Unique artifacts are retained; log-tail
+rotation does not delete them. Keep workflow children in the managed
+foreground
+process group rather than launching escaped writers.
+.PP
+Automatic pressure recovery covers inactive Cargo incremental output and proven
+generated dependency objects in shared Cargo profiles, Gradle task/transform
+build caches and Xcode DerivedData. Exported binaries, root libraries and
+unmarked locations are preserved. Source, uncommitted
+work,
+credentials, databases, active outputs, disk images and unique artifacts
+remain
+protected. No manually approved path list is required for these categories.
+.PP
+The installer adds reversible PATH blocks for new zsh and bash shells and
+scoped build-tool wrappers. Noninteractive cargo, Gradle, Xcode, Swift,
+package-manager,
+Make, CMake, Ninja and test-tool invocations then use synchronous managed jobs
+with original arguments, stdin, separate output streams and exit status.
+A nested tool joins only its actual live managed process group and held lease.
+Terminal invocations pass directly to the original executable, preserving its
+controlling terminal and job control without claiming managed execution.
+Explicit executable paths, existing shells with an older PATH, interpreter
+entrypoints and environments replacing PATH remain outside executable lookup;
+submit those workflows explicitly. No shell trap or interpreter override is
+installed.
+.PP
+An external work broker, such as a CI runner pool or VM host, can share
+admission through the documented provider protocol (docs/admission-protocol.md):
+its published commitments take admission slots, and it can count running jobs
+under the same admission lock. Submission inside work a broker started, marked by
+.BR DISK_JANITOR_BROKER ,
+is rejected rather than making a nested reservation. Platform sandbox permissions,
+approvals
+and explicit denials continue to apply. The runtime is not a privileged daemon
+or a security boundary against other processes using the same OS account.
+.SH EXIT STATUS
+For submit, status, logs and cancel, zero means that the requested CLI
+operation
+succeeded; it does not imply that a submitted job succeeded.
+.TP
+.B 0
+Successful CLI operation, or successful command when returned by wait.
+.TP
+.B 1
+Job lookup, ownership, submission or other operational error.
+.TP
+.B 2
+Invalid public-job command syntax or arguments.
+.TP
+.B 125
+Wait could not establish a trustworthy execution outcome.
+.TP
+.B 126, 127
+Wait reports that the command could not be executed, or was not found,
+respectively.
+.TP
+.B 130
+The observing CLI was interrupted with SIGINT. This does not cancel its job.
+.TP
+.B 143
+Wait reports cancellation or a command terminated by SIGTERM.
+.PP
+Otherwise wait returns the command's exit status; signal termination is
+normalized
+to 128 plus the signal number. Command statuses can coincide with the codes
+above.
+The short-summary dispatcher returns 1 for an unknown top-level command.
+.SH ENVIRONMENT
+.TP
+.B DISK_JANITOR_HOME
+Application directory; defaults to $HOME/.disk-janitor. Normally leave this
+unset.
+.TP
+.B DISK_JANITOR_ARTIFACT_ROOT
+Set by the runtime for the submitted command; do not supply an output-root
+option.
+.TP
+.B CODEX_THREAD_ID, CLAUDE_SESSION_ID
+Agent identity used to restrict cancellation to owned jobs.
+.TP
+.B DISK_JANITOR_BROKER
+Set by an external broker in the environment of work it started; submission there
+is rejected as a nested reservation.
 .SH FILES
 .TP
+.B ~/.disk-janitor/jobs/JOB/
+Private durable job metadata, lifetime locks, diagnostic tail and retained
+artifacts.
+Observe these through the CLI; do not edit records or remove locks.
+.TP
 .B ~/.disk-janitor/config.env
-User configuration.
+Existing shared-backend configuration. Ordinary jobs need no configuration.
 .TP
-.B ~/.disk-janitor/state
-Tracked install state (backups and origins for clean uninstall).
-.TP
-.B ~/Library/LaunchAgents/disk-janitor.plist
-Scheduled job on macOS (launchd).
-.TP
-.B ~/.config/systemd/user/disk-janitor.timer
-Scheduled job on Linux (systemd user timer); a crontab entry is used as a fallback.
-.SH "WHAT IT NEVER TOUCHES"
-Source code, and AI-agent chat history / transcripts:
-.BR ~/.claude/projects ,
-.BR ~/.codex/sessions ,
-and similar. Only regenerable build artifacts and abandoned worktree checkouts are removed.
-.SH "EXIT STATUS"
-.B 0
-on success;
-.B 1
-on an unknown command or flag;
-.B 2
-when a configured project directory is unsafe (for example
-.BR $HOME ).
-.SH "SEE ALSO"
-.BR cargo-sweep (1),
-.BR pnpm (1),
-.BR git-worktree (1)
-.SH "REPORTING BUGS"
-https://github.com/WillieCubed/disk-janitor/issues
-.SH LICENSE
-MIT.
+.B ~/.disk-janitor/guard-reservations/
+Shared-backend admission and result evidence, including legacy callers.
+.SH EXAMPLES
+Submit a test command, wait for its outcome, and read its retained output:
+.PP
+.nf
+job=$(disk-janitor submit -- python3 -m unittest discover -s tests)
+disk-janitor status "$job"
+disk-janitor wait "$job"
+disk-janitor logs "$job"
+.fi
+.PP
+Submit an explicit shell workflow and follow its output:
+.PP
+.nf
+job=$(disk-janitor submit -- sh -eu -c 'make build && make test')
+disk-janitor logs "$job" -f
+disk-janitor wait "$job"
+.fi
+.PP
+Inspect the queue as JSON, or cancel an owned job and wait for teardown:
+.PP
+.nf
+disk-janitor status --json
+disk-janitor cancel "$job"
+disk-janitor wait "$job"
+.fi
+.SH COMPATIBILITY
+Existing install, uninstall, run, recover, reclaim, guard, admit, config and
+guidance commands remain available for maintenance and legacy integrations.
+In particular, run still means cleanup; it does not submit a command.
+They are outside the ordinary public job interface documented here.
+.SH VERIFICATION
+The repository's formal/README.md documents bounded TLA+/TLC model checks,
+assumptions and implementation-conformance tests. These are not an unbounded
+proof of arbitrary commands, the OS or complete implementation refinement.
+.SH SEE ALSO
+.BR man (1),
+.BR sh (1)
