@@ -133,8 +133,8 @@ agents_block() {
   output locations. Source, uncommitted work, credentials, databases and active output
   are preserved; automatic reclamation is limited to the authorized inactive Cargo
   incremental and proven generated dependency objects, Gradle task/transform build
-  caches, Xcode DerivedData, finished linked worktrees and the oversized output
-  files of launchd agents.
+  caches, Xcode DerivedData, ignored build/.next/.turbo output in idle checkouts,
+  finished linked worktrees and the oversized output files of launchd agents.
 - Work an external broker started (DISK_JANITOR_BROKER is set) stays in that broker;
   do not nest another reservation.
   Commands execute in the submitting permission context. Platform approvals and
