@@ -25,6 +25,32 @@ import uuid
 GIB = 2**30
 
 
+RECORD_SIZE = 4096
+
+
+def rewrite_in_place(path, held, data):
+    """Replace a locked file's content so a lock-free reader always sees valid JSON.
+
+    Truncating first leaves the file empty for a moment, and shrinking it after
+    a longer record lets a reader that sized its buffer from the old length cut
+    the next one short. The record is instead padded with spaces, which JSON
+    ignores, to a fixed size and written over the old one in a single write; the
+    file never shrinks. The lock stays on the original inode, so this writes
+    through a second descriptor and refuses any other file.
+    """
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        if os.fstat(descriptor).st_ino != os.fstat(held).st_ino:
+            return False
+        os.pwrite(descriptor, data.ljust(max(RECORD_SIZE, os.fstat(descriptor).st_size)), 0)
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def atomic_json(path, value):
     path = Path(path)
     if path.is_symlink(): raise ValueError('unsafe runtime metadata')

@@ -13,6 +13,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import time
 
 import jobs
 
@@ -131,15 +132,90 @@ def owned_json(path, private=False):
         return json.load(stream)
 
 
+def parent_table():
+    """Map every live pid to its parent pid from one ps snapshot; empty when ps fails."""
+    ps = shutil.which('ps', path='/bin:/usr/bin')
+    if not ps:
+        return {}
+    try:
+        output = subprocess.run([ps, '-axo', 'pid=,ppid='], capture_output=True, text=True, timeout=10,
+                                env={'PATH': '/bin:/usr/bin', 'LC_ALL': 'C'}).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            table[int(fields[0])] = int(fields[1])
+    return table
+
+
+def ancestry(pid, table):
+    """Parent-pid chain from pid upward. A process reparented to launchd ends at pid 1 without a match."""
+    chain, seen = [], set()
+    while pid is not None and pid > 1 and pid not in seen:
+        seen.add(pid)
+        chain.append(pid)
+        pid = table.get(pid)
+    return chain
+
+
+def read_record(stream):
+    """Read a reservation the guard may be rewriting; a torn read is retried, never trusted."""
+    for attempt in range(20):
+        stream.seek(0)
+        try:
+            return json.load(stream)
+        except json.JSONDecodeError:
+            time.sleep(.005)
+    raise ValueError('reservation record is unreadable')
+
+
+def proven_controller(path, record, chain, table):
+    """Whether this live running record's controller or runtime supervisor is an ancestor of the caller."""
+    controller = record.get('child')
+    if record.get('state') != 'running' or type(controller) is not int or controller not in chain:
+        return False
+    try:
+        if os.getpgid(controller) != controller:
+            return False  # The controller leads its own group; a reused pid will not.
+    except OSError:
+        return False
+    runtime_hint = record.get('runtime_file')
+    if runtime_hint is None:
+        return True  # Original guard: its session supervisor is the controller.
+    runtime_path = path.with_suffix('.runtime')
+    if not isinstance(runtime_hint, str) or Path(runtime_hint).resolve(strict=True) != runtime_path.resolve(strict=True):
+        return False
+    runtime = owned_json(runtime_path, private=True)
+    group = runtime.get('runtime_group')
+    return (runtime.get('job_id') == record.get('id')
+            and runtime.get('owner') == record.get('owner')
+            and runtime.get('command_hash') == record.get('command_hash')
+            and runtime.get('controller_pid') == controller
+            and type(group) is int and group in chain and table.get(group) == controller)
+
+
 def covered(home):
-    """Join only the caller's actual live owned process group, never an env claim."""
+    """Join an admitted job only when the caller descends from its controller by real parent pids.
+
+    Process group and session play no part: turbo starts every task in its own
+    group and a Gradle daemon leads its own session, yet both belong to the job
+    that started them. An orphan reparented to launchd has left the chain and
+    is not covered. Environment variables are never consulted.
+    """
     registry = home / 'guard-reservations'
     if not registry.exists():
         return False
     if registry.is_symlink():
         raise ValueError('unsafe reservation registry')
-    group = os.getpgrp()
-    session = os.getsid(0)
+    snapshot = []
+
+    def lineage():
+        if not snapshot:
+            table = parent_table()
+            snapshot.extend((table, ancestry(os.getpid(), table)))
+        return snapshot
     for path in registry.glob('*.json'):
         if not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}\.json', path.name):
             continue
@@ -155,27 +231,11 @@ def covered(home):
                     continue  # An unheld/stale record cannot cover anything.
                 except BlockingIOError:
                     pass
-                record = json.load(stream)
-                controller = record.get('child')
-                if record.get('state') != 'running' or type(controller) is not int:
-                    continue
-                # Original guard uses its session supervisor as record.child.
-                if controller == group == session and os.getpgid(controller) == group:
+                record = read_record(stream)
+                table, chain = lineage()
+                if proven_controller(path, record, chain, table):
                     return True
-                # The pressure runtime places the command in its owned subgroup.
-                runtime_path = path.with_suffix('.runtime')
-                runtime_hint = record.get('runtime_file')
-                if not isinstance(runtime_hint, str) or Path(runtime_hint).resolve(strict=True) != runtime_path.resolve(strict=True):
-                    continue
-                runtime = owned_json(runtime_path, private=True)
-                if (runtime.get('job_id') == record.get('id')
-                        and runtime.get('owner') == record.get('owner')
-                        and runtime.get('command_hash') == record.get('command_hash')
-                        and runtime.get('controller_pid') == controller
-                        and runtime.get('runtime_group') == group
-                        and session == group and os.getpgid(group) == group):
-                    return True
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, AttributeError):
             continue  # Missing or ambiguous proof never grants a bypass.
     return False
 

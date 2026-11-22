@@ -5,6 +5,14 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## Unreleased
 
+### Fixed
+- A build tool started anywhere inside a running job now runs in that job's slot. Coverage follows
+  real parent pids from the job's controller, so a turbo task in its own process group and a Gradle
+  daemon in its own session are covered; an unrelated process or an orphan reparented to launchd is
+  not. Jobs that spawned children through the shims used to queue them behind their own slots and
+  deadlock once every slot held a parent.
+- The reservation record is rewritten in place at a fixed size, so a reader never sees it empty.
+
 ### Changed
 - A job waits only for a free slot. Slots follow the machine's cores and memory, the queue is
   first come, first served, and `status` shows each waiting job's position. Disk is decided when

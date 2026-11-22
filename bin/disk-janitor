@@ -827,7 +827,11 @@ try:
     result_file=registry/(job_id+'.result')
 
     def write_record():
-        reservation.seek(0);reservation.truncate();json.dump(record,reservation);reservation.flush()
+        # Nested build tools read this record without a lock to prove they run
+        # inside this job, so it must parse at every instant.
+        from capacity import rewrite_in_place
+        if not rewrite_in_place(job_path,reservation.fileno(),json.dumps(record).encode()):
+            reservation.seek(0);reservation.truncate();json.dump(record,reservation);reservation.flush()
 
     def retire_records():
         # This job's reservation stays, locked, until the process is gone: observers
