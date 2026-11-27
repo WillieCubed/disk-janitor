@@ -15,7 +15,7 @@ class PublicJobCLI(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name).resolve()
         self.env = dict(os.environ, HOME=str(self.home), DISK_JANITOR_HOME=str(self.home / '.dj'),
-                        DISK_JANITOR_NO_SCHED='1')
+                        DISK_JANITOR_NO_SCHED='1', DISK_JANITOR_STORAGE_ROOT='none')
 
     def invoke(self, *args, script=None, env=None):
         return subprocess.run([str(script or REPO / 'bin/disk-janitor'), *args],

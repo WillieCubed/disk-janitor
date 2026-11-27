@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import plistlib
 import re
 import select
 from pathlib import Path
@@ -67,11 +68,37 @@ def atomic_json(path, value):
         if temporary.exists(): temporary.unlink()
 
 
+STORAGE_PER_SLOT = 16 * GIB
+
+
+def storage_roots():
+    """Volumes build output may land on: the home volume plus the external storage roots."""
+    roots = [Path.home()]
+    roots += [Path(entry) for entry in os.environ.get('DISK_JANITOR_STORAGE_ROOTS', '').split(':') if entry]
+    return roots
+
+
+def storage_free(roots=None):
+    """Free bytes across distinct filesystems; an absent or unreadable root adds nothing."""
+    seen, free = set(), 0
+    for root in storage_roots() if roots is None else roots:
+        try:
+            device = Path(root).stat().st_dev
+            if device not in seen:
+                seen.add(device)
+                free += shutil.disk_usage(root).free
+        except OSError:
+            continue
+    return free
+
+
 def slot_limit():
     """How many build jobs run at once before the machine is oversubscribed.
 
-    A build uses several cores and several GiB, so there is one slot per four cores and
-    per 16 GiB of memory, whichever is fewer. DISK_JANITOR_MAX_RUNNING overrides it.
+    Builds wait on I/O and linking for much of their run, so two cores carry one job. Each
+    job also gets 16 GiB of memory and 16 GiB of free space on the volumes its output can
+    use, external storage roots included. The fewest of the three wins.
+    DISK_JANITOR_MAX_RUNNING overrides it.
     """
     configured = os.environ.get('DISK_JANITOR_MAX_RUNNING', '')
     if configured.isdigit() and int(configured) > 0:
@@ -80,7 +107,45 @@ def slot_limit():
         memory = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
     except (ValueError, OSError):
         memory = 16 * GIB
-    return max(1, min((os.cpu_count() or 4) // 4, memory // (16 * GIB)))
+    disk = storage_free() // STORAGE_PER_SLOT
+    return max(1, min((os.cpu_count() or 4) // 2, memory // (16 * GIB), disk))
+
+
+def _apfs_info(mount):
+    try:
+        output = subprocess.run(['diskutil', 'info', '-plist', str(mount)], capture_output=True,
+                                timeout=10, check=False).stdout
+        return plistlib.loads(output) if output else {}
+    except (OSError, ValueError, subprocess.SubprocessError, plistlib.InvalidFileException):
+        return {}
+
+
+def external_storage_root(volumes=Path('/Volumes'), info=_apfs_info):
+    """The mounted external volume with the most free space that can hold build output.
+
+    Only writable APFS or HFS+ volumes off the internal disk qualify: Cargo, pnpm cloning
+    and Xcode need clonefile, permissions and case handling that exFAT does not give.
+    """
+    best, best_free = None, -1
+    try:
+        candidates = sorted(volumes.iterdir())
+    except OSError:
+        return None
+    for mount in candidates:
+        try:
+            if mount.is_symlink() or not os.path.ismount(mount) or not os.access(mount, os.W_OK):
+                continue
+            details = info(mount)
+            if details.get('Internal', True) or not details.get('WritableVolume', False):
+                continue
+            if details.get('FilesystemType') not in ('apfs', 'hfs'):
+                continue
+            free = shutil.disk_usage(mount).free
+        except OSError:
+            continue
+        if free > best_free:
+            best, best_free = mount, free
+    return best
 
 
 def _private_directory(app_home, name):
@@ -688,5 +753,9 @@ def controller_main(config, supervisor, inherited):
     return 143
 
 
-if __name__ == '__main__':
+if __name__ == '__main__' and sys.argv[1:] == ['storage-root']:
+    print(external_storage_root() or '')
+elif __name__ == '__main__' and sys.argv[1:] == ['slot-limit']:
+    print(slot_limit())
+elif __name__ == '__main__':
     raise SystemExit(controller_main(json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[3])))

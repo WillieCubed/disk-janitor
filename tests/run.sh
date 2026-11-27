@@ -6,7 +6,7 @@ SB="$(mktemp -d)"
 mkdir -p "$SB/.codex"
 printf 'existing codex guidance\n' > "$SB/.codex/AGENTS.md"
 printf 'prefer-frozen-lockfile=true\n' > "$SB/.npmrc"
-dj() { env -i HOME="$SB" PATH="$PATH" DISK_JANITOR_HOME="$SB/.dj" DISK_JANITOR_NO_SCHED=1 TERM=dumb bash "$REPO/bin/disk-janitor" "$@"; }
+dj() { env -i HOME="$SB" PATH="$PATH" DISK_JANITOR_HOME="$SB/.dj" DISK_JANITOR_NO_SCHED=1 DISK_JANITOR_STORAGE_ROOT=none TERM=dumb bash "$REPO/bin/disk-janitor" "$@"; }
 
 fail=0
 check() { if eval "$2"; then printf '  ✓ %s\n' "$1"; else printf '  ✗ %s\n' "$1"; fail=1; fi; }
