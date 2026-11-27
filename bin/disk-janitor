@@ -134,8 +134,10 @@ agents_block() {
 - Submit build, test and local validation workflows with \`disk-janitor submit -- COMMAND\`.
   It returns a job ID immediately. Use \`disk-janitor wait JOB\`, \`status JOB\`,
   \`logs JOB\` (or \`logs JOB -f\`) and \`cancel JOB\` for jobs you own.
-- Do not choose disk budgets, scheduling classes, reserve exceptions, storage roots
-  or restart policy. Do not edit queue records, locks, receipts or private policy.
+- Ordinary jobs pass no resource options. Agents may tune the machine-wide policy
+  when the queue or the disk calls for it: set MAX_RUNNING, FLOOR_GIB, LOW_WATER_GIB
+  or STORAGE_ROOT in \`$CONFIG_FILE\` and run \`disk-janitor install\`.
+  Do not edit queue records, locks, receipts or private policy.
   Accepted work stays queued and resumes automatically; acceptance is not completion.
 - Every submission is a new invocation, even for identical commands. When a submit
   result is uncertain, inspect \`disk-janitor status\` before submitting again.
