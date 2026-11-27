@@ -190,6 +190,7 @@ class ReclaimTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'darwin', 'launchd schedule')
     def test_hourly_schedule_and_uninstall_are_managed(self):
         self.env['DISK_JANITOR_NO_SCHED'] = '1'
+        self.env['DISK_JANITOR_STORAGE_ROOT'] = 'none'
         home = self.home / '.dj'
         home.mkdir()
         (home / 'approved-artifacts.json').write_text(json.dumps(dict(version=1, entries=self.entries)))

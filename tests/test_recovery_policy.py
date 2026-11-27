@@ -128,7 +128,7 @@ class CleanerRegressionTests(unittest.TestCase):
     def test_install_copies_recovery_implementation(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
-            env = dict(os.environ, HOME=td, DISK_JANITOR_HOME=str(home / '.dj'), DISK_JANITOR_NO_SCHED='1')
+            env = dict(os.environ, HOME=td, DISK_JANITOR_HOME=str(home / '.dj'), DISK_JANITOR_NO_SCHED='1', DISK_JANITOR_STORAGE_ROOT='none')
             r = subprocess.run(['/bin/bash', str(REPO / 'bin/disk-janitor'), 'install'],
                                env=env, text=True, capture_output=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -138,7 +138,7 @@ class CleanerRegressionTests(unittest.TestCase):
     def test_scheduling_dynamic_recovery_needs_no_approval_manifest(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
-            env = dict(os.environ, HOME=td, DISK_JANITOR_HOME=str(home / '.dj'), DISK_JANITOR_NO_SCHED='1')
+            env = dict(os.environ, HOME=td, DISK_JANITOR_HOME=str(home / '.dj'), DISK_JANITOR_NO_SCHED='1', DISK_JANITOR_STORAGE_ROOT='none')
             r = subprocess.run(['/bin/bash', str(REPO / 'bin/disk-janitor'), 'reclaim', '--schedule'],
                                env=env, text=True, capture_output=True, timeout=10)
             if sys.platform != 'darwin':

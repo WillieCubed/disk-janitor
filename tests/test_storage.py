@@ -18,7 +18,7 @@ class JanitorRunTests(unittest.TestCase):
         (self.home / '.cache/cargo-target').mkdir(parents=True)
         self.env = dict(os.environ, HOME=str(self.home),
                         DISK_JANITOR_HOME=str(self.home / '.dj'),
-                        DISK_JANITOR_NO_SCHED='1',
+                        DISK_JANITOR_NO_SCHED='1', DISK_JANITOR_STORAGE_ROOT='none',
                         PATH=str(self.fakebin) + ':' + os.environ['PATH'])
         for name in ('cargo', 'cargo-sweep'):
             self.command(name, 'exit 0')

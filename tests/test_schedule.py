@@ -17,7 +17,7 @@ class ScheduleTests(unittest.TestCase):
         self.home = Path(self.tmp.name).resolve()
         subprocess.run([str(REPO / 'bin/disk-janitor'), 'reclaim', '--schedule'], check=True,
                        capture_output=True, timeout=30,
-                       env=dict(os.environ, HOME=str(self.home), DISK_JANITOR_NO_SCHED='1',
+                       env=dict(os.environ, HOME=str(self.home), DISK_JANITOR_NO_SCHED='1', DISK_JANITOR_STORAGE_ROOT='none',
                                 DISK_JANITOR_HOME=str(self.home / '.disk-janitor')))
 
     def agent(self, name):

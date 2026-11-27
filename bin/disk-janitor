@@ -43,6 +43,7 @@ RUN_HOUR=3
 RUN_MINUTE=0
 AGENT_GUIDANCE=0                              # 1 = manage worktree guidance in agent config files
 AGENT_GUIDANCE_FILES=("$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md")
+STORAGE_ROOT="${DISK_JANITOR_STORAGE_ROOT:-auto}" # auto = largest external APFS volume; none = home only; or a path
 # shellcheck source=/dev/null
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -50,6 +51,17 @@ AGENT_GUIDANCE_FILES=("$HOME/.codex/AGENTS.md" "$HOME/.claude/CLAUDE.md")
 [ -z "${FLOOR_GIB:-}" ] || export DISK_JANITOR_FLOOR_GIB="$FLOOR_GIB"
 [ -z "${MAX_RUNNING:-}" ] || export DISK_JANITOR_MAX_RUNNING="$MAX_RUNNING"
 [ -z "${LOW_WATER_GIB:-}" ] || export DISK_JANITOR_LOW_WATER_GIB="$LOW_WATER_GIB"
+# The storage root chosen at the last install or maintenance pass; see apply_storage.
+STORAGE_ACTIVE_ROOT=""
+# shellcheck source=/dev/null
+[ -f "$STATE_DIR/storage.env" ] && . "$STATE_DIR/storage.env"
+if [ -n "$STORAGE_ACTIVE_ROOT" ] && [ -d "$STORAGE_ACTIVE_ROOT/caches" ]; then
+  CARGO_TARGET="$STORAGE_ACTIVE_ROOT/caches/cargo-target"; PNPM_STORE="$STORAGE_ACTIVE_ROOT/caches/pnpm-store"
+  export DISK_JANITOR_STORAGE_ROOTS="$STORAGE_ACTIVE_ROOT"
+else
+  CARGO_TARGET="$TARGET_DIR"; PNPM_STORE=""
+fi
+export DISK_JANITOR_CARGO_TARGET="$CARGO_TARGET" DISK_JANITOR_PNPM_STORE="$PNPM_STORE"
 # Checkouts of the repositories under these roots have their idle build outputs recovered.
 DISK_JANITOR_PROJECT_DIRS="$(IFS=:; printf '%s' "${PROJECT_DIRS[*]}")"; export DISK_JANITOR_PROJECT_DIRS
 
@@ -139,7 +151,7 @@ agents_block() {
   do not nest another reservation.
   Commands execute in the submitting permission context. Platform approvals and
   explicit denials still apply; this tool is not an approval bypass.
-- Shared Cargo output remains \`$TARGET_DIR\`; do not override CARGO_TARGET_DIR.
+- Shared Cargo output remains \`$CARGO_TARGET\`; do not override CARGO_TARGET_DIR.
   pnpm remains configured for shared-store cloning; never copy target/node_modules.
   A linked worktree is retired automatically once its work is merged, squash-merged
   or its branch is deleted upstream, and it has been clean and idle for 48 hours;
@@ -308,6 +320,42 @@ guard_paths() { # refuse to operate on $HOME or /
 }
 
 # ====================== commands ======================
+# ---------- storage root (external volume for build output and caches) ----------
+resolve_storage_root() { # echo the root to use, or nothing for the home volume
+  case "$STORAGE_ROOT" in
+    none|"") return 0 ;;
+    auto) python3 -B "$(runtime_directory)/capacity.py" storage-root 2>/dev/null || true ;;
+    *) [ -d "$STORAGE_ROOT" ] && [ -w "$STORAGE_ROOT" ] && printf '%s\n' "$STORAGE_ROOT" ;;
+  esac
+}
+apply_storage() { # [--quiet]: point Cargo and pnpm at the storage root, or back at home
+  local root; root="$(resolve_storage_root)"
+  if [ -n "$root" ] && mkdir -p "$root/caches/cargo-target" "$root/caches/pnpm-store" 2>/dev/null; then
+    CARGO_TARGET="$root/caches/cargo-target"; PNPM_STORE="$root/caches/pnpm-store"
+    export DISK_JANITOR_STORAGE_ROOTS="$root"
+  else
+    root=""; CARGO_TARGET="$TARGET_DIR"; PNPM_STORE=""; unset DISK_JANITOR_STORAGE_ROOTS
+  fi
+  export DISK_JANITOR_CARGO_TARGET="$CARGO_TARGET" DISK_JANITOR_PNPM_STORE="$PNPM_STORE"
+  mkdir -p "$STATE_DIR" "$CARGO_TARGET"
+  printf 'STORAGE_ACTIVE_ROOT=%q\n' "$root" > "$STATE_DIR/storage.env.tmp" && mv -f "$STATE_DIR/storage.env.tmp" "$STATE_DIR/storage.env"
+  manage_file "$HOME/.cargo/config.toml" \
+"# $SENTINEL — shared Cargo target dir (deps compile once across worktrees)
+[build]
+target-dir = \"$CARGO_TARGET\"" cargo-config
+  manage_file "$HOME/.npmrc" \
+"# $SENTINEL — link node_modules from the pnpm store instead of copying
+package-import-method=$NPM_IMPORT_METHOD${PNPM_STORE:+
+store-dir=$PNPM_STORE}" npmrc
+  ensure_agents_block
+  [ "${1:-}" = --quiet ] && return 0
+  ok "shared Cargo target dir → $CARGO_TARGET"
+  ok "pnpm linking: package-import-method=$NPM_IMPORT_METHOD${PNPM_STORE:+, store → $PNPM_STORE}"
+}
+storage_stale() { # the chosen root vanished, or auto mode has none and a drive may have appeared
+  if [ -n "$STORAGE_ACTIVE_ROOT" ]; then [ ! -d "$STORAGE_ACTIVE_ROOT/caches" ]; else [ "$STORAGE_ROOT" = auto ]; fi
+}
+
 cmd_install() {
   local with_guidance=0
   while [ $# -gt 0 ]; do
@@ -329,16 +377,7 @@ cmd_install() {
   grep -q '^AGENT_GUIDANCE=' "$CONFIG_FILE" 2>/dev/null \
     && sed_i "s/^AGENT_GUIDANCE=.*/AGENT_GUIDANCE=$AGENT_GUIDANCE/" "$CONFIG_FILE"
 
-  manage_file "$HOME/.cargo/config.toml" \
-"# $SENTINEL — shared Cargo target dir (deps compile once across worktrees)
-[build]
-target-dir = \"$TARGET_DIR\"" cargo-config
-  ok "shared Cargo target dir → $TARGET_DIR"
-
-  manage_file "$HOME/.npmrc" \
-"# $SENTINEL — link node_modules from the pnpm store instead of copying
-package-import-method=$NPM_IMPORT_METHOD" npmrc
-  ok "pnpm linking: package-import-method=$NPM_IMPORT_METHOD"
+  apply_storage
 
   if command -v cargo-sweep >/dev/null 2>&1; then ok "cargo-sweep present ($(cargo-sweep --version 2>/dev/null))"
   elif command -v cargo >/dev/null 2>&1; then
@@ -1336,6 +1375,15 @@ PY
 }
 
 cmd_recover() {
+  # The watchdog falls back to the home volume within a minute of a drive vanishing; the
+  # hourly maintenance pass also adopts a drive that appeared since.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --watchdog) [ -n "$STORAGE_ACTIVE_ROOT" ] && storage_stale && apply_storage --quiet ;;
+      --maintain) storage_stale && apply_storage --quiet ;;
+    esac
+  done
   local module; module="$(runtime_module recovery.py)" || return $?
   python3 "$module" "$@"
 }

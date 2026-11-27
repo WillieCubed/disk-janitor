@@ -265,8 +265,17 @@ def _cargo_profiles(cargo):
                     yield profile
 
 
+# The wrapper exports where Cargo and pnpm write once an external storage root is in use.
+CACHE_OVERRIDES = {'.cache/cargo-target': 'DISK_JANITOR_CARGO_TARGET', 'Library/pnpm/store': 'DISK_JANITOR_PNPM_STORE'}
+
+
+def _cache_root(home, relative):
+    configured = os.environ.get(CACHE_OVERRIDES.get(relative, ''), '')
+    return Path(configured) if configured.startswith('/') else home / relative
+
+
 def _cargo_candidates(home):
-    cargo = home / '.cache/cargo-target'
+    cargo = _cache_root(home, '.cache/cargo-target')
     if _plain(cargo, True):
         for profile in _cargo_profiles(cargo):
             incremental = profile / 'incremental'
@@ -679,8 +688,8 @@ def space(home, observer=activity):
         folder = str(_worktree_folder(checkout, home))
         count, total = folders.get(folder, (0, 0))
         folders[folder] = (count + 1, total + size)
-    caches = {label: dict(bytes=_allocated(home / relative), reclaimed=reclaimed)
-              for label, relative, reclaimed in CACHE_ROOTS if (home / relative).is_dir()}
+    caches = {label: dict(bytes=_allocated(_cache_root(home, relative)), reclaimed=reclaimed)
+              for label, relative, reclaimed in CACHE_ROOTS if _cache_root(home, relative).is_dir()}
     cap = _log_cap_bytes()
     logs = [dict(path=str(p), bytes=p.lstat().st_blocks * 512, over_cap=p.lstat().st_size > cap)
             for p in service_logs(home)]
@@ -737,7 +746,7 @@ def candidates(home, occupied=None, deadline=None):
 
 def _scope(kind, home):
     if kind.startswith('cargo-'):
-        return home / '.cache/cargo-target'
+        return _cache_root(home, '.cache/cargo-target')
     if kind.startswith('gradle-'):
         return home / '.gradle/caches'
     return home / 'Library/Developer/Xcode/DerivedData'

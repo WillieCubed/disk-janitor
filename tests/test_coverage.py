@@ -22,7 +22,7 @@ class BuildCoverage(unittest.TestCase):
         self.home = Path(self.tmp.name).resolve()
         self.app = self.home / '.dj'
         self.env = dict(os.environ, HOME=str(self.home), DISK_JANITOR_HOME=str(self.app),
-                        DISK_JANITOR_NO_SCHED='1')
+                        DISK_JANITOR_NO_SCHED='1', DISK_JANITOR_STORAGE_ROOT='none')
         for key in ('DISK_JANITOR_BROKER',):
             self.env.pop(key, None)
 

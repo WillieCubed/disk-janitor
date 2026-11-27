@@ -15,7 +15,7 @@ teardown() { chmod -R u+w "$SB"; rm -rf "$SB"; }
 
 dj() {
   env -i HOME="$SB" PATH="$PATH" DISK_JANITOR_HOME="$SB/.dj" \
-      DISK_JANITOR_NO_SCHED=1 TERM=dumb bash "$REPO/bin/disk-janitor" "$@"
+      DISK_JANITOR_NO_SCHED=1 DISK_JANITOR_STORAGE_ROOT=none TERM=dumb bash "$REPO/bin/disk-janitor" "$@"
 }
 
 @test "version prints" {
