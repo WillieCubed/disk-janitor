@@ -1337,25 +1337,26 @@ def request_preemption(app_home, requester_id):
 
 
 def start_stalled(app_home, seconds, interval=2):
-    """Watch the queue; a job waiting beside a free slot is a fault, so let the oldest start.
+    """Watch each lane's queue; a job waiting beside a free slot is a fault, so let the oldest start.
 
     The same oldest ticket seen twice with a slot free gets a grant its waiter honours
     without regard to order. Nothing is signalled and no job is started from here.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from capacity import queue_view
-    granted, previous = [], None
+    from capacity import LANES, queue_view
+    granted, previous = [], {}
     end = time.monotonic() + seconds
     while True:
-        view = queue_view(app_home)
-        oldest = view['waiting'][0] if view['waiting'] and view['busy'] < view['limit'] else None
-        if oldest and oldest == previous:
-            grant = Path(app_home) / 'queue' / (oldest + '.go')
-            if not grant.is_symlink() and not grant.exists():
-                with os.fdopen(os.open(grant, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600), 'w') as output:
-                    json.dump(dict(at=time.time(), busy=view['busy'], limit=view['limit']), output)
-                granted.append(oldest)
-        previous = oldest
+        for lane, (_, queue) in LANES.items():
+            view = queue_view(app_home, lane=lane)
+            oldest = view['waiting'][0] if view['waiting'] and view['busy'] < view['limit'] else None
+            if oldest and oldest == previous.get(lane):
+                grant = Path(app_home) / queue / (oldest + '.go')
+                if not grant.is_symlink() and not grant.exists():
+                    with os.fdopen(os.open(grant, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600), 'w') as output:
+                        json.dump(dict(at=time.time(), busy=view['busy'], limit=view['limit']), output)
+                    granted.append(oldest)
+            previous[lane] = oldest
         if time.monotonic() + interval >= end:
             return granted
         time.sleep(interval)

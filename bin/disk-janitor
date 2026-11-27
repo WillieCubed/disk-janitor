@@ -50,6 +50,7 @@ STORAGE_ROOT="${DISK_JANITOR_STORAGE_ROOT:-auto}" # auto = largest external APFS
 # Optional capacity policy from the config file reaches the runtime as environment.
 [ -z "${FLOOR_GIB:-}" ] || export DISK_JANITOR_FLOOR_GIB="$FLOOR_GIB"
 [ -z "${MAX_RUNNING:-}" ] || export DISK_JANITOR_MAX_RUNNING="$MAX_RUNNING"
+[ -z "${FAST_SLOTS:-}" ] || export DISK_JANITOR_FAST_SLOTS="$FAST_SLOTS"
 [ -z "${LOW_WATER_GIB:-}" ] || export DISK_JANITOR_LOW_WATER_GIB="$LOW_WATER_GIB"
 # The storage root chosen at the last install or maintenance pass; see apply_storage.
 STORAGE_ACTIVE_ROOT=""
@@ -135,8 +136,8 @@ agents_block() {
   It returns a job ID immediately. Use \`disk-janitor wait JOB\`, \`status JOB\`,
   \`logs JOB\` (or \`logs JOB -f\`) and \`cancel JOB\` for jobs you own.
 - Ordinary jobs pass no resource options. Agents may tune the machine-wide policy
-  when the queue or the disk calls for it: set MAX_RUNNING, FLOOR_GIB, LOW_WATER_GIB
-  or STORAGE_ROOT in \`$CONFIG_FILE\` and run \`disk-janitor install\`.
+  when the queue or the disk calls for it: set MAX_RUNNING, FAST_SLOTS, FLOOR_GIB,
+  LOW_WATER_GIB or STORAGE_ROOT in \`$CONFIG_FILE\` and run \`disk-janitor install\`.
   Do not edit queue records, locks, receipts or private policy.
   Accepted work stays queued and resumes automatically; acceptance is not completion.
 - Every submission is a new invocation, even for identical commands. When a submit
@@ -454,7 +455,7 @@ p.add_argument('--restartable', action='store_true', help='allow bounded coopera
 p.add_argument('--restart-kind', choices=['build','test','preview'], help='required disposable workflow declaration for --restartable; never deployments or migrations')
 p.add_argument('--recovery-after-seconds', type=float, default=30, help='minimum spacing between automatic recovery attempts')
 p.add_argument('--memory-gib', type=float, default=0, help='optional measured peak memory commitment')
-p.add_argument('--light', action='store_true', help=argparse.SUPPRESS)
+p.add_argument('--lane', choices=['light','fast','build'], default='build', help=argparse.SUPPRESS)
 p.add_argument('--reclaim-seconds', type=float, default=2.5, help=argparse.SUPPRESS)
 p.add_argument('--lock-seconds', type=float, default=1, help=argparse.SUPPRESS)
 p.add_argument('--max-running', type=int, default=0, help=argparse.SUPPRESS)
@@ -940,7 +941,7 @@ try:
         # and memory stay zero so no reader counts this job as a claim on capacity.
         record={'id':job_id,'owner':a.owner,'pid':os.getpid(),'command_hash':command_hash,
                 'state':'waiting','created':a.submitted_at if a.submitted_at is not None else previous.get('created',time.time()) if raw else time.time(),'budget':0,'planned':a.planned_gib*2**30,
-                'retention_limit':a.max_retained_gib*2**30,'memory':0,'class':a.work_class,'artifact':str(a.artifact_root.resolve()) if a.artifact_root else None,
+                'retention_limit':a.max_retained_gib*2**30,'memory':0,'class':a.work_class,'lane':a.lane,'artifact':str(a.artifact_root.resolve()) if a.artifact_root else None,
                 'retention':str((a.retention_root or a.artifact_root).resolve()) if a.artifact_root else None,'retention_identity':list(retention_identity) if a.artifact_root else None,'volumes':[{'path':str(p),'device':d,'reserve':r*2**30,'budget':0} for p,d,r in volumes],
                 'child':None,'runtime_file':str(registry/(job_id+'.runtime')),'consumed':{},'restartable':a.restartable,'restart_kind':a.restart_kind,'preemptions':0}
         write_record()
@@ -978,38 +979,42 @@ try:
         return level.returncode==0 and level.stdout.strip().isdigit() and int(level.stdout.strip())>=4
 
     def wait_for_slot():
-        # The only reason a job waits: every slot is held by a running job. Slots are
-        # kernel locks and the queue is locked tickets, so nothing stale holds either.
-        from capacity import slot_limit, take_slot, join_queue, waiting_tickets
+        # The only reason a job waits: every slot in its lane is held by a running job. Slots
+        # are kernel locks and the queue is locked tickets, so nothing stale holds either.
+        from capacity import lane_limit, take_slot, join_queue, waiting_tickets
         from commitments import Commitments
-        limit=a.max_running or slot_limit()
+        lane=a.lane
+        limit=(a.max_running if lane=='build' else 0) or lane_limit(lane)
         asked=0
         def runners():
             # Work an external broker (docs/admission-protocol.md) has committed is work
-            # this machine is running, so each commitment takes a slot. One slot always
+            # this machine is running, so each commitment takes a build slot. One slot always
             # stays open to local jobs: a commitment never withdrawn cannot hold them all.
+            if lane!='build':return 0
             claims,problems=Commitments().gather(guard_home=home)
             for problem in problems:
                 if problem not in warnings:warnings.append(problem);notice('external commitments ignored: '+problem)
             return min(limit-1,len(claims))
         submitted=record['created']
         # A job that yielded its slot queues again from now, behind the job it yielded to.
-        ticket,ticket_fd=join_queue(home,time.time() if record.get('preemptions') else submitted,job_id)
+        ticket,ticket_fd=join_queue(home,time.time() if record.get('preemptions') else submitted,job_id,lane)
         granted=ticket.with_name(ticket.name+'.go')
         try:
             while True:
                 check_cancelled()
-                ahead=[name for name in waiting_tickets(home) if name<ticket.name]
+                ahead=[name for name in waiting_tickets(home,lane=lane) if name<ticket.name]
                 ci=runners()
                 if not ahead or granted.exists():
-                    held=take_slot(home,limit-ci)
+                    held=take_slot(home,limit-ci,lane)
                     if held is not None:return held
                 waited=time.time()-submitted
                 if a.once or time.monotonic()>=deadline or waited>a.max_queue_seconds:
-                    raise Refused('no free slot after %.0f s: all %d slots are running jobs%s and %d earlier jobs are waiting'
-                                  % (max(0,waited),limit,' (%d held by external broker commitments)'%ci if ci else '',len(ahead)))
+                    raise Refused('no free %sslot after %.0f s: all %d %sslots are running jobs%s and %d earlier jobs are waiting'
+                                  % ('fast ' if lane=='fast' else '',max(0,waited),limit,'fast ' if lane=='fast' else '',
+                                     ' (%d held by external broker commitments)'%ci if ci else '',len(ahead)))
                 os.utime(ticket_fd)  # Still polling: jobs behind this one know it is live.
-                if a.work_class=='feedback' and not ahead and time.monotonic()-asked>=1:
+                # A build yielding its slot frees nothing in the fast pool, so only the build lane asks.
+                if lane=='build' and a.work_class=='feedback' and not ahead and time.monotonic()-asked>=1:
                     # Existing contract: an explicitly restartable build may yield its
                     # slot to waiting feedback work. Only its own guardian stops it.
                     asked=time.monotonic()
@@ -1030,8 +1035,8 @@ try:
         # slot is held: the job starts, or it fails with the reason it cannot.
         global before,marker,slot
         with control_decision(require_accepted=True):pass
-        if not a.light and slot is None:slot=wait_for_slot()
-        if a.light:
+        if a.lane!='light' and slot is None:slot=wait_for_slot()
+        if a.lane=='light':
             # No build tool runs, so no headroom is required and no cache is in use.
             free={str(path):shutil.disk_usage(path).free for path,device,_ in volumes if device is not None}
         else:
@@ -1189,7 +1194,7 @@ os.killpg(os.getpgrp(),signal.SIGKILL)
         if not module.is_file() or module.is_symlink():raise RuntimeError('owned runtime controller is unavailable')
         start_read,start_write=os.pipe()
         inherited=(write_fd,reservation.fileno(),lock.fileno())+((log_descriptor,) if log_descriptor>=0 else ())+((slot,) if slot is not None else ())
-        runtime_config={'volumes':[dict(path=str(path),device=device,reserve=0 if a.light else reserve*2**30,mount_required=True) for path,device,reserve in volumes if device is not None],
+        runtime_config={'volumes':[dict(path=str(path),device=device,reserve=0 if a.lane=='light' else reserve*2**30,mount_required=True) for path,device,reserve in volumes if device is not None],
                         'runtime_file':str(registry/(job_id+'.runtime')),'outcome_file':str(registry/(job_id+'.outcome')),
                         'result_file':str(result_file),'guard_fd':lock.fileno(),'start_fd':start_read,
                         'control_file':str(a.job_control_file or ''),'foreground_stdio':a.foreground_stdio,
