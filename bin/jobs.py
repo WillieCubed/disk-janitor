@@ -20,6 +20,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from capacity import LearningStore, queue_view
 
+GIB = 2 ** 30
 TERMINAL = frozenset({'succeeded', 'failed', 'cancelled', 'unknown'})
 # Commands that plainly run no build tool need no disk headroom to start.
 LIGHT = frozenset({'git', 'gh', 'echo', 'printf', 'true', 'false', 'ls', 'cat', 'pwd', 'date', 'sleep', 'which',
@@ -28,16 +29,53 @@ LIGHT = frozenset({'git', 'gh', 'echo', 'printf', 'true', 'false', 'ls', 'cat', 
 HEAVY = re.compile(r'(?<![A-Za-z0-9])(gradle\w*|cargo|rustc|xcodebuild|swift\w*|npm|npx|pnpm|yarn|bun|make|cmake|'
                    r'ninja|bazel|mvn|docker|flutter|dotnet|java\w*|kotlin\w*|clang|gcc|tsc|vite|turbo|pytest|'
                    r'unittest|tox|pip\d?|uv|build|compile|assemble|test|install|run|emulator|adb)(?![A-Za-z0-9])', re.I)
+# A check whose every recent run took more than this from its volume is not a short check.
+FAST_LANE_BYTES = 2 * GIB
 EXECUTOR_ATTEMPTS = 3
 SILENT_SECONDS = 2 * 3600
 STATES = frozenset({'queued', 'running', 'cancelling'}) | TERMINAL
-GIB = 2 ** 30
 
 
 def client_identity(environment):
     agent = environment.get('CODEX_THREAD_ID') or environment.get('CLAUDE_SESSION_ID')
     label = 'agent:' + agent if agent else 'user:' + str(os.getuid())
     return hashlib.sha256(label.encode()).hexdigest()[:24], bool(agent)
+
+
+def without_environment(command):
+    words = list(command)
+    while words and (Path(words[0]).name == 'env' or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', words[0])):
+        words = words[1:]
+    return words
+
+
+def test_runner(command):
+    """Whether a command is a known lightweight test runner run directly, not through a script.
+
+    Only the interpreter's own runners count: pytest, python -m pytest or unittest, and
+    node --test. A positional argument before the runner flag, such as a script name,
+    means some other program decides what runs, so the command is not one of these.
+    """
+    words = without_environment(command)
+    if not words:
+        return False
+    executable = Path(words[0]).name.lower()
+    if executable in ('pytest', 'py.test'):
+        return True
+    if re.fullmatch(r'python(\d+(\.\d+)?)?', executable):
+        for index, word in enumerate(words[1:], 1):
+            if word == '-m':
+                return words[index + 1:index + 2] in (['pytest'], ['unittest'])
+            if not word.startswith('-') or word.startswith('-c'):
+                return False
+        return False
+    if executable == 'node':
+        for word in words[1:]:
+            if word == '--test':
+                return True
+            if not word.startswith('-'):
+                return False
+    return False
 
 
 def policy(command):
@@ -48,7 +86,7 @@ def policy(command):
         return {'kind':'probe','disk_gib':.05,'memory_gib':.25}
     if executable in ('true', 'false', 'echo', 'printf'):
         return {'kind': 'small', 'disk_gib': .05, 'memory_gib': .125}
-    if executable in ('pytest', 'py.test') or (executable.startswith('python') and command[1:3] == ['-m', 'unittest']):
+    if test_runner(command):
         return {'kind': 'checks', 'disk_gib': 1, 'memory_gib': 2}
     if executable in ('cargo', 'gradle', 'gradlew', 'xcodebuild', 'swift', 'swiftc', 'rustc'):
         return {'kind': 'native', 'disk_gib': 4, 'memory_gib': 8}
@@ -57,11 +95,30 @@ def policy(command):
 
 def light(command):
     """Whether a command is known to run no build tool. Anything uncertain is not light."""
-    words = list(command)
-    while words and (Path(words[0]).name == 'env' or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', words[0])):
-        words = words[1:]
+    words = without_environment(command)
     return (bool(words) and Path(words[0]).name.lower() in LIGHT
             and not any(HEAVY.search(word) for word in command))
+
+
+def lane(command, profile):
+    """Which pool a job waits in: none (light), the small fast pool, or the build pool.
+
+    A light command runs no build tool and takes no slot. A version probe or a known test
+    runner takes a fast slot, so it never waits behind builds, unless at least two recent
+    runs from the same directory each took more than FAST_LANE_BYTES from the volume; one
+    noisy run on a busy machine does not demote it. Fast jobs keep the disk floor and the
+    runtime reserve of build jobs; only the slot pool differs.
+    """
+    if light(command):
+        return 'light'
+    heavy = profile.get('observation_count', 0) >= 2 and profile.get('least_observed_bytes', 0) > FAST_LANE_BYTES
+    return 'fast' if profile.get('kind') in ('checks', 'probe') and not heavy else 'build'
+
+
+def job_lane(value):
+    """A job's lane; records written before lanes existed carry only the light flag."""
+    profile = value.get('profile') or {}
+    return profile.get('lane') or ('light' if profile.get('light') else 'build')
 
 
 def lock_within(stream, seconds):
@@ -185,7 +242,7 @@ class Store:
         learning = LearningStore(self.home / 'capacity-history')
         observation_key = learning.key(command, cwd)
         profile = learning.predict(observation_key, policy(command))
-        profile['light'] = light(command)
+        profile['lane'] = lane(command, profile)
         value = {'version': 1, 'id': job, 'backend_job_id': job, 'owner': 'job:' + owner,
                  'client': owner, 'agent_client': agent, 'submitted_at': time.time(),
                  'argv': list(command), 'label': Path(command[0]).name,
@@ -261,11 +318,13 @@ class Store:
         if result is not None and result.get('reason') and state in TERMINAL:
             value['reason'] = result['reason']
         try:
-            if state == 'queued':
-                queue = queue_view(self.home, job)
+            if state == 'queued' and job_lane(value) != 'light':
+                pool = job_lane(value)
+                queue = queue_view(self.home, job, pool)
                 if queue['position']:
-                    value['reason'] = ('waiting for a free slot: position %d of %d; %d of %d slots are running jobs'
-                                       % (queue['position'], len(queue['waiting']), queue['busy'], queue['limit']))
+                    value['reason'] = ('waiting for a free %sslot: position %d of %d; %d of %d %sslots are running jobs'
+                                       % ('fast ' if pool == 'fast' else '', queue['position'], len(queue['waiting']),
+                                          queue['busy'], queue['limit'], 'fast ' if pool == 'fast' else ''))
             elif state == 'running':
                 quiet = time.time() - max((self.directory(job) / 'output.log').stat().st_mtime, value['submitted_at'])
                 if quiet > SILENT_SECONDS:
@@ -298,9 +357,10 @@ class Store:
 def public(value):
     # Commands may contain credentials. Public status includes an executable label,
     # not argument strings or the submitting environment.
-    return {key: value.get(key) for key in ('id', 'state', 'label', 'submitted_at', 'updated_at',
-            'exit_code', 'cwd', 'artifact_root', 'worker_pid', 'guardian_pid', 'reason', 'restartable',
-            'output_mode', 'pressure_blocked', 'pressure_observed', 'enforcement', 'blocked_since', 'executor_unavailable')}
+    return dict({key: value.get(key) for key in ('id', 'state', 'label', 'submitted_at', 'updated_at',
+                 'exit_code', 'cwd', 'artifact_root', 'worker_pid', 'guardian_pid', 'reason', 'restartable',
+                 'output_mode', 'pressure_blocked', 'pressure_observed', 'enforcement', 'blocked_since',
+                 'executor_unavailable')}, lane=job_lane(value))
 
 
 def submit(store, command):
@@ -334,9 +394,10 @@ def guard_command(store, meta):
                '--memory-gib', str(profile['memory_gib']), '--warn-free-gib', '0', '--quiet',
                '--submitted-at', str(meta['submitted_at']),
                '--job-control-file', str(store.directory(meta['id']) / 'job.json'),
-               '--job-log-file', str(store.directory(meta['id']) / 'output.log')]
-    if profile.get('light'):
-        return command + ['--light', '--', *meta['argv']]
+               '--job-log-file', str(store.directory(meta['id']) / 'output.log'),
+               '--lane', job_lane(meta)]
+    if job_lane(meta) == 'light':
+        return command + ['--', *meta['argv']]
     # Only filesystems this job names are required: its working directory and any
     # external path among its arguments. Each has a small floor, not a shared reserve.
     mounts = {}
@@ -509,6 +570,7 @@ def main():
                 print(json.dumps(values))
             elif args.job:
                 print(f"{values['id']} {values['state']} exit={values['exit_code']}")
+                print('lane: ' + values['lane'])
                 if values.get('reason') and not (values.get('pressure_observed') or values.get('executor_unavailable')):
                     print('reason: ' + str(values['reason']))
                 if values.get('pressure_observed') or values.get('executor_unavailable'):
@@ -520,7 +582,7 @@ def main():
                 for j in values:
                     phase='executor-unavailable' if j.get('executor_unavailable') else 'pressure-blocked' if j.get('pressure_blocked') else 'pressure-observed' if j.get('pressure_observed') else j['state']
                     note = f"  ({j['reason']})" if j.get('reason') and phase in ('queued', 'running') else ''
-                    print(f"{j['id']} {phase:10} {j['label']}{note}")
+                    print(f"{j['id']} {phase:10} {j['lane']:5} {j['label']}{note}")
         elif args.action == 'logs':
             logs(store, args.job, args.follow)
         elif args.action == 'wait':

@@ -24,6 +24,11 @@ All notable changes to this project are documented here. Format loosely follows
   space above a low-water mark every minute.
 
 ### Added
+- Short checks have their own lane. A version probe or a test runner the interpreter provides
+  (`pytest`, `python -m pytest`, `python -m unittest`, `node --test`) waits for one of three fast
+  slots (`FAST_SLOTS`) instead of queueing behind builds. The lane follows from the command and its
+  recorded disk use, never from a flag, and a fast job keeps the build disk floor and reserve.
+  `status` shows each job's lane.
 - A shared admission protocol (`docs/admission-protocol.md`): an external broker such as a CI
   runner pool or VM host publishes its commitments, which take admission slots, and can count
   running jobs under the same admission lock. Work it starts, marked by `DISK_JANITOR_BROKER`, is

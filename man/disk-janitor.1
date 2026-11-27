@@ -125,7 +125,7 @@ are:
 .B true, false, echo, printf
 0.05 disk; 0.125 memory.
 .TP
-.B pytest, py.test, python* -m unittest
+.B pytest, py.test, python* -m pytest, python* -m unittest, node --test
 1 disk; 2 memory.
 .TP
 .B cargo, gradle, gradlew, xcodebuild, swift, swiftc, rustc
@@ -145,6 +145,14 @@ it. Waiting is first come, first served, and status shows the position. Slots
 and queue places are kernel locks, so a crashed job or stale record holds
 neither. Commands that plainly run no build tool take no slot. A job still
 waiting after an hour fails with that reason.
+.PP
+Short checks wait in a separate fast lane of three slots (FAST_SLOTS
+overrides it), never behind builds. A version probe or one of the test
+runners listed above, run directly rather than through a script or package
+manager, is a short check. One whose last two or more runs each took more
+than 2 GiB from its volume returns to the build lane. Fast jobs keep the disk
+floor and runtime reserve of builds. status shows each job's lane: light,
+fast or build.
 .PP
 Disk is decided once the slot is held. With the floor free (FLOOR_GIB, default
 5) the job starts. Below it one recovery pass of a few seconds runs, then the

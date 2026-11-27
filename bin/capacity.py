@@ -155,14 +155,33 @@ def _private_directory(app_home, name):
     return directory
 
 
-def take_slot(app_home, limit):
+FAST_SLOTS = 3
+
+# Each lane is its own pool of slot locks and its own queue, so a short check never waits
+# behind a build and a build never counts a check against its own limit.
+LANES = {'build': ('slot-%d.lock', 'queue'), 'fast': ('fast-slot-%d.lock', 'fast-queue')}
+
+
+def fast_slot_limit():
+    """How many short checks run at once beside the builds. DISK_JANITOR_FAST_SLOTS overrides it."""
+    configured = os.environ.get('DISK_JANITOR_FAST_SLOTS', '')
+    if configured.isdigit() and int(configured) > 0:
+        return int(configured)
+    return FAST_SLOTS
+
+
+def lane_limit(lane):
+    return fast_slot_limit() if lane == 'fast' else slot_limit()
+
+
+def take_slot(app_home, limit, lane='build'):
     """Hold a slot for as long as the returned descriptor stays open, or return None.
 
     The kernel lock is the slot: a holder that dies frees it, and no record can occupy one.
     """
     directory = _private_directory(app_home, 'slots')
     for index in range(limit):
-        descriptor = os.open(directory / ('slot-%d.lock' % index), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(directory / (LANES[lane][0] % index), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return descriptor
@@ -171,11 +190,11 @@ def take_slot(app_home, limit):
     return None
 
 
-def slots_busy(app_home, limit):
+def slots_busy(app_home, limit, lane='build'):
     busy = 0
     for index in range(limit):
         try:
-            descriptor = os.open(Path(app_home) / 'slots' / ('slot-%d.lock' % index), os.O_RDONLY | os.O_NOFOLLOW)
+            descriptor = os.open(Path(app_home) / 'slots' / (LANES[lane][0] % index), os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
             continue
         try:
@@ -191,13 +210,13 @@ def _ticket_name(name):
     return len(name) > 21 and name[:20].isdigit() and name[20] == '-' and not name.endswith('.go')
 
 
-def join_queue(app_home, created, job_id):
+def join_queue(app_home, created, job_id, lane='build'):
     """Queue behind earlier submissions. Returns the ticket path and its locked descriptor.
 
     The ticket is published already locked, and its lock is what makes it count: a waiter
     that dies leaves the queue with no cleanup, and a stale file is never a place in line.
     """
-    directory = _private_directory(app_home, 'queue')
+    directory = _private_directory(app_home, LANES[lane][1])
     ticket = directory / ('%020d-%s' % (int(created * 1e6), job_id))
     staged = directory / ('.joining-' + uuid.uuid4().hex)
     descriptor = os.open(staged, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -211,13 +230,13 @@ def join_queue(app_home, created, job_id):
     return ticket, descriptor
 
 
-def waiting_tickets(app_home, fresh_seconds=5):
+def waiting_tickets(app_home, fresh_seconds=5, lane='build'):
     """Tickets, oldest first, whose waiter holds its lock and has polled recently.
 
     A ticket nobody holds is removed. One whose waiter stopped polling is ignored, so a
     stuck process cannot keep the jobs behind it from a free slot.
     """
-    directory = Path(app_home) / 'queue'
+    directory = Path(app_home) / LANES[lane][1]
     try:
         names = sorted(name for name in os.listdir(directory) if _ticket_name(name))
     except OSError:
@@ -242,12 +261,12 @@ def waiting_tickets(app_home, fresh_seconds=5):
     return live
 
 
-def queue_view(app_home, job_id=None):
-    """Slot use and queue order for status and the watchdog; never an admission input."""
-    limit = slot_limit()
-    waiting = waiting_tickets(app_home)
+def queue_view(app_home, job_id=None, lane='build'):
+    """One lane's slot use and queue order for status and the watchdog; never an admission input."""
+    limit = lane_limit(lane)
+    waiting = waiting_tickets(app_home, lane=lane)
     position = next((index + 1 for index, name in enumerate(waiting) if name[21:] == job_id), None)
-    return dict(limit=limit, busy=slots_busy(app_home, limit), waiting=waiting, position=position)
+    return dict(limit=limit, busy=slots_busy(app_home, limit, lane), waiting=waiting, position=position)
 
 
 def _durable_json(path, payload):
@@ -416,6 +435,9 @@ class LearningStore:
         else:
             result['disk_gib'] = max(result['disk_gib'], learned)
         result['observation_count'] = len(samples)
+        # Each sample is the volume's free-space drop while the job ran, so other jobs' writes
+        # inflate it. The smallest sample is the closest bound on what this command itself writes.
+        result['least_observed_bytes'] = min(s['bytes'] for s in samples)
         result['disk_by_device'] = {str(device):max(baseline['disk_gib'], max(s['bytes'] for s in samples if s['device']==device)/GIB*1.5+.05) for device in {s['device'] for s in samples}}
         result['observed_devices'] = sorted({s['device'] for s in samples})
         return result

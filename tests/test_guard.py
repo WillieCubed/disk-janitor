@@ -49,7 +49,8 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn('disk-janitor submit', result.stdout)
         self.assertIn('build, test and local validation', result.stdout)
-        self.assertIn('Do not choose disk budgets', result.stdout)
+        self.assertIn('Ordinary jobs pass no resource options', result.stdout)
+        self.assertIn('Do not edit queue records, locks, receipts or private policy', result.stdout)
         self.assertIn('submitting permission context', result.stdout)
 
     def test_missing_external_mount_rejects_before_command(self):
