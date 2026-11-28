@@ -77,6 +77,28 @@ class JobTests(unittest.TestCase):
             self.assertEqual(self.invoke('wait', job).returncode, 0)
         self.assertEqual((self.home / 'calls').read_text().count('called'), 2)
 
+    def test_prune_removes_only_old_finished_jobs_and_stale_caches(self):
+        old = self.submit('pass')
+        recent = self.submit('pass')
+        for job in (old, recent):
+            self.until(lambda job=job: self.status(job)['state'] == 'succeeded')
+        record = self.app / 'jobs' / old / 'job.json'
+        value = json.loads(record.read_text())
+        value['updated_at'] = value['submitted_at'] = time.time() - 4 * 86400
+        record.write_text(json.dumps(value))
+        stale = self.app / ('retention-' + 'a' * 20 + '.json')
+        fresh = self.app / ('retention-' + 'b' * 20 + '.json')
+        stale.write_text('{}')
+        fresh.write_text('{}')
+        past = time.time() - 7200
+        os.utime(stale, (past, past))
+        result = self.invoke('_prune')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.app / 'jobs' / old).exists())
+        self.assertTrue((self.app / 'jobs' / recent).exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+
     def test_failure_exit_code_and_logs_are_observable(self):
         job = self.submit('import sys;print("failure evidence");sys.exit(7)')
         self.assertEqual(self.invoke('wait', job).returncode, 7)
