@@ -131,6 +131,18 @@ class BuildCoverage(unittest.TestCase):
         self.assertFalse((self.home / '.zshenv').exists())
         self.assertFalse((self.app / 'shims').exists())
 
+    def test_install_drops_compiler_shims_and_keeps_user_files(self):
+        shims = self.install()
+        stale = shims / 'rustc'
+        stale.write_text((shims / 'cargo').read_text())
+        mine = shims / 'my-helper'
+        mine.write_text('#!/bin/sh\necho mine\n')
+        self.install()
+        self.assertFalse(stale.exists(), 'a compiler shim from an earlier install survived')
+        self.assertFalse((shims / 'swiftc').exists())
+        self.assertTrue((shims / 'cargo').exists())
+        self.assertEqual(mine.read_text(), '#!/bin/sh\necho mine\n')
+
     @unittest.skipUnless(Path('/bin/zsh').is_file(), 'zsh is not installed')
     def test_new_zsh_shell_intercepts_without_manual_activation(self):
         self.install()
