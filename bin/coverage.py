@@ -19,7 +19,10 @@ import jobs
 
 # Interpreter and shell entrypoints are deliberately absent: wrapping them would
 # recursively intercept the scheduler itself and change unrelated shell work.
-TOOLS = ('cargo', 'rustc', 'gradle', 'gradlew', 'xcodebuild', 'swift', 'swiftc',
+# Compilers (rustc, swiftc) are absent too: cargo and swift run them once per
+# crate or module, and when the parent ran unmanaged from a terminal every one
+# of those children became its own job, about 11,000 a day on one machine.
+TOOLS = ('cargo', 'gradle', 'gradlew', 'xcodebuild', 'swift',
          'pnpm', 'npm', 'yarn', 'bun', 'make', 'gmake', 'cmake', 'ninja',
          'pytest', 'py.test', 'tsc', 'vitest', 'jest')
 SHELLS = ('.zshenv', '.zprofile', '.zshrc', '.bashrc', '.bash_profile')
@@ -67,6 +70,12 @@ def install_shell():
             raise ValueError('coverage shim must not be a symlink: ' + name)
         path.write_text(shim_body)
         path.chmod(0o700)
+    # A tool dropped from TOOLS keeps its shim from an earlier install unless removed;
+    # only files this installer wrote are removed.
+    for path in shims.iterdir():
+        if (path.name not in TOOLS and not path.is_symlink() and path.is_file()
+                and ' shim "$0" "$@"' in path.read_text(errors='replace')):
+            path.unlink()
     state = home / 'state' / 'coverage-shell'
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     quoted = shlex.quote(str(shims))
