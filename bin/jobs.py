@@ -179,6 +179,65 @@ def lease_held(path):
         return False
 
 
+# Finished jobs stay inspectable for three days. Retention caches are fresh for
+# seconds (see retained() in bin/disk-janitor), so an hour-old one is dead weight.
+JOB_RETENTION_SECONDS = 3 * 86400
+RETENTION_CACHE_SECONDS = 3600
+RETENTION_CACHE = re.compile(r'retention-[0-9a-f]{20}(\.json|\.scan-status\.json|\.scan\.lock)')
+
+
+def held(path):
+    """True when another process holds the lock file; a missing file is not held."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def prune(store, now=None):
+    """Remove finished jobs past retention and stale retention caches; return the counts."""
+    now = time.time() if now is None else now
+    jobs_removed = caches_removed = 0
+    if store.root.is_dir() and not store.root.is_symlink():
+        for directory in store.root.iterdir():
+            if not re.fullmatch(r'j-[0-9a-f]{32}', directory.name) or directory.is_symlink():
+                continue
+            try:
+                value = store.view(directory.name)
+                finished = value.get('updated_at') or value.get('submitted_at') or 0
+                if (value['state'] not in TERMINAL or now - finished < JOB_RETENTION_SECONDS
+                        or held(directory / 'worker.lock') or held(directory / 'job.lock')):
+                    continue
+                shutil.rmtree(directory)
+                jobs_removed += 1
+            except (OSError, ValueError, KeyError, TypeError):
+                continue  # An unreadable record is kept; pruning never guesses.
+    groups = {}
+    for path in store.home.iterdir():
+        match = RETENTION_CACHE.fullmatch(path.name)
+        if match and not path.is_symlink():
+            groups.setdefault(path.name[:len('retention-') + 20], []).append(path)
+    for stem, paths in groups.items():
+        try:
+            if held(store.home / (stem + '.scan.lock')):
+                continue
+            if any(now - p.lstat().st_mtime < RETENTION_CACHE_SECONDS for p in paths):
+                continue
+            for p in paths:
+                p.unlink(missing_ok=True)
+                caches_removed += 1
+        except OSError:
+            continue
+    return jobs_removed, caches_removed
+
+
 class Store:
     def __init__(self, app_home=None):
         self.home = Path(app_home or os.environ.get('DISK_JANITOR_HOME', str(Path.home() / '.disk-janitor')))
@@ -556,6 +615,7 @@ def main():
     for name in ('wait', 'cancel', '_worker'):
         p = sub.add_parser(name, help=argparse.SUPPRESS if name == '_worker' else name + ' for one job')
         p.add_argument('job')
+    sub.add_parser('_prune', help=argparse.SUPPRESS)
     args = parser.parse_args()
     store = Store()
     try:
@@ -599,6 +659,9 @@ def main():
             print(meta['id'] + ' ' + meta['state'])
         elif args.action == '_worker':
             return worker(store, args.job)
+        elif args.action == '_prune':
+            removed, caches = prune(store)
+            print(f'pruned {removed} finished jobs and {caches} stale retention cache files')
         return 0
     except (OSError, ValueError, RuntimeError, KeyError) as error:
         print('disk-janitor: ' + str(error), file=sys.stderr)

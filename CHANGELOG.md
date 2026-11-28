@@ -6,6 +6,12 @@ All notable changes to this project are documented here. Format loosely follows
 ## Unreleased
 
 ### Fixed
+- `rustc` and `swiftc` are no longer shimmed, and an install removes their old shims. Cargo and
+  swift run a compiler once per crate or module, so a `cargo build` started from a terminal (which
+  runs unmanaged) turned every compile into its own job, about 11,000 a day on one machine.
+- The hourly maintenance pass prunes finished jobs older than three days and retention caches
+  older than an hour. Both used to pile up forever, reaching 43,000 job folders and 129,000
+  cache files.
 - A build tool started anywhere inside a running job now runs in that job's slot. Coverage follows
   real parent pids from the job's controller, so a turbo task in its own process group and a Gradle
   daemon in its own session are covered; an unrelated process or an orphan reparented to launchd is

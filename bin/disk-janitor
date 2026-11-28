@@ -1388,7 +1388,11 @@ cmd_recover() {
   for arg in "$@"; do
     case "$arg" in
       --watchdog) [ -n "$STORAGE_ACTIVE_ROOT" ] && storage_stale && apply_storage --quiet ;;
-      --maintain) storage_stale && apply_storage --quiet ;;
+      --maintain)
+        storage_stale && apply_storage --quiet
+        # Finished jobs and per-job retention caches otherwise accumulate forever.
+        local jobs_module
+        jobs_module="$(runtime_module jobs.py)" && python3 "$jobs_module" _prune >/dev/null 2>&1 || true ;;
     esac
   done
   local module; module="$(runtime_module recovery.py)" || return $?
